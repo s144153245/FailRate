@@ -2,8 +2,12 @@
 """CLI version of the Testing Summary Tool for WSL environments."""
 
 import sys
+import argparse
+import threading
+import queue
 import pandas as pd
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 from bs4 import BeautifulSoup
 from requests.packages.urllib3.exceptions import InsecureRequestWarning
@@ -515,7 +519,25 @@ def _errorcode_summary(
     return out
 
 
-def run_yield_and_errorcode_summary(log, excel_path: str = ""):
+def _create_repair_session(log) -> requests.Session:
+    """Create and log in a new repair portal session."""
+    session = requests.Session()
+    if not login(session, log):
+        raise RuntimeError("Repair portal login failed.")
+    return session
+
+
+def _query_sn_with_pool(pool: queue.Queue, sn: str, log) -> tuple[str, int, str, str]:
+    """Borrow a session from the pool, query repair record, return session."""
+    session = pool.get()
+    try:
+        has_repair, repair_error, prev_stage = has_repair_record(session, sn, log)
+        return sn, has_repair, repair_error, prev_stage
+    finally:
+        pool.put(session)
+
+
+def run_yield_and_errorcode_summary(log, excel_path: str = "", workers: int = 5):
     log("Running Repair ErrorCode summary...")
 
     if excel_path:
@@ -536,25 +558,38 @@ def run_yield_and_errorcode_summary(log, excel_path: str = ""):
     last_df = df.groupby(SN_COL, as_index=False).tail(1).reset_index(drop=True)
     total_units = int(last_df[SN_COL].nunique())
 
-    # Login once
-    session = requests.Session()
-    if not login(session, log):
-        raise RuntimeError("Repair portal login failed.")
+    # Build session pool
+    log(f"[Repair] Creating {workers} sessions...")
+    session_pool: queue.Queue[requests.Session] = queue.Queue()
+    for i in range(workers):
+        log(f"[Repair] Session {i + 1}/{workers} logging in...")
+        session_pool.put(_create_repair_session(log))
 
-    # Repair lookup per SN (cached)
+    # Concurrent repair lookup per SN
+    sn_list = list(dict.fromkeys(last_df[SN_COL].tolist()))  # deduplicated, order preserved
     repair_map = {}
     repair_error_map = {}
     repair_prev_stage_map = {}
-    sn_list = last_df[SN_COL].tolist()
-    log(f"[Repair] Checking repair records for {len(sn_list)} units...")
-    for idx, sn in enumerate(sn_list, start=1):
-        if sn in repair_map:
-            continue
-        log(f"[Repair] ({idx}/{len(sn_list)}) {sn}")
-        has_repair, repair_error, prev_stage = has_repair_record(session, sn, log)
-        repair_map[sn] = has_repair
-        repair_error_map[sn] = repair_error
-        repair_prev_stage_map[sn] = prev_stage
+    total_sns = len(sn_list)
+    log(f"[Repair] Checking repair records for {total_sns} units with {workers} workers...")
+
+    progress_lock = threading.Lock()
+    progress_counter = [0]
+
+    def _worker(sn: str) -> tuple[str, int, str, str]:
+        result = _query_sn_with_pool(session_pool, sn, log)
+        with progress_lock:
+            progress_counter[0] += 1
+            log(f"[Repair] ({progress_counter[0]}/{total_sns}) {sn}")
+        return result
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {executor.submit(_worker, sn): sn for sn in sn_list}
+        for future in as_completed(futures):
+            sn, has_repair, repair_error, prev_stage = future.result()
+            repair_map[sn] = has_repair
+            repair_error_map[sn] = repair_error
+            repair_prev_stage_map[sn] = prev_stage
 
     last_df["HasRepair"] = last_df[SN_COL].map(repair_map).fillna(0).astype(int)
     last_df["RepairErrorCode"] = last_df[SN_COL].map(repair_error_map).fillna("")
@@ -628,14 +663,38 @@ def log(msg: str):
     print(msg, flush=True)
 
 
+def _validate_date(date_str: str) -> str:
+    """Validate YYYY-MM-DD format and return 'YYYY-MM-DD 18:00'."""
+    try:
+        datetime.strptime(date_str, "%Y-%m-%d")
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"Invalid date format: '{date_str}'. Expected YYYY-MM-DD.")
+    return f"{date_str} 18:00"
+
+
 def main():
-    import argparse
+    global TEST_START_TIME, TEST_END_TIME
+
     parser = argparse.ArgumentParser(description="Testing Summary Tool (CLI)")
     parser.add_argument("-f", "--file", default="", help="Path to local Excel file (skip portal fetch)")
+    parser.add_argument("-s", "--start-date", default="", help="Start date (YYYY-MM-DD), auto-appends 18:00")
+    parser.add_argument("-e", "--end-date", default="", help="End date (YYYY-MM-DD), auto-appends 18:00")
+    parser.add_argument("-w", "--workers", type=int, default=5, choices=range(1, 11),
+                        metavar="[1-10]", help="Number of concurrent repair workers (default: 5)")
     args = parser.parse_args()
 
+    if not args.file and not (args.start_date and args.end_date):
+        parser.error("Either -f/--file or both -s/--start-date and -e/--end-date are required.")
+
+    if args.start_date:
+        TEST_START_TIME = _validate_date(args.start_date)
+        log(f"[Config] Start time: {TEST_START_TIME}")
+    if args.end_date:
+        TEST_END_TIME = _validate_date(args.end_date)
+        log(f"[Config] End time: {TEST_END_TIME}")
+
     try:
-        run_yield_and_errorcode_summary(log, excel_path=args.file)
+        run_yield_and_errorcode_summary(log, excel_path=args.file, workers=args.workers)
     except Exception as e:
         print(f"ERROR: {e}", file=sys.stderr)
         sys.exit(1)
