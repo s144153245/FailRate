@@ -9,10 +9,18 @@ import pandas as pd
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
+import time
 from bs4 import BeautifulSoup
 from requests.packages.urllib3.exceptions import InsecureRequestWarning
 
 requests.packages.urllib3.disable_warnings(category=InsecureRequestWarning)
+
+# Use lxml for faster HTML parsing if available, fallback to html.parser
+try:
+    import lxml  # noqa: F401
+    HTML_PARSER = "lxml"
+except ImportError:
+    HTML_PARSER = "html.parser"
 
 # ------------------ COLUMN CONFIG ------------------ #
 SN_COL = "SerialNumber"
@@ -231,7 +239,7 @@ def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 # ------------------ REPAIR PORTAL HELPERS ------------------ #
 def extract_form_fields(html, form_selector="form"):
-    soup = BeautifulSoup(html, "html.parser")
+    soup = BeautifulSoup(html, HTML_PARSER)
     form = soup.select_one(form_selector)
     if not form:
         raise RuntimeError("No form found on repair page.")
@@ -275,10 +283,10 @@ def login(session: requests.Session, log) -> bool:
 
 
 def query_barcode(session: requests.Session, barcode: str) -> str:
-    resp = session.get(BARCODE_URL, verify=VERIFY_SSL)
-    resp.raise_for_status()
-    form_data = extract_form_fields(resp.text)
-
+    # Skip GET request — use hardcoded form fields directly (POST only)
+    form_data = {}
+    form_data["_EVENTTARGET"] = ""
+    form_data["_EVENTARGUMENT"] = ""
     form_data["_VIEWSTATE"] = (
         "/wEPDwUKLTQ4OTEwNDc2Mg8WAh4KTUlCQVNJQzAwMzLABgABAAAA/////wEAAAAAAAAADAIAAABBTUlCQVNJQzAwMCwgVmVyc2lvbj0zLjAuMC41LCBDdWx0dXJlPW5ldXRyYWwsIFB1YmxpY0tleVRva2VuPW51bGwMAwAAAElTeXN0ZW0sIFZlcnNpb249NC4wLjAuMCwgQ3VsdHVyZT1uZXV0cmFsLCBQdWJsaWNLZXlUb2tlbj1iNzdhNWM1NjE5MzRlMDg5BQEAAAAUTUlCQVNJQzAwMC5jbHNQdWJsaWMGAAAACG1fdXNlcmlkB21fc0RhdGUMbV9zUmVzdWx0U1FMBG1fSVAHbV9VU05fWBdtX1VzblVuUGFja2FnZUhhc2hUYWJsZQEBAQQBAxRTeXN0ZW0uTmV0LklQQWRkcmVzcwMAAAAcU3lzdGVtLkNvbGxlY3Rpb25zLkhhc2h0YWJsZQIAAAAGBAAAAAgxMTEwOTExNwYFAAAAAAkFAAAACQYAAAAJBQAAAAkIAAAABQYAAAAUU3lzdGVtLk5ldC5JUEFkZHJlc3MFAAAACW1fQWRkcmVzcwhtX0ZhbWlseQltX051bWJlcnMJbV9TY29wZUlkCm1fSGFzaENvZGUABAcAAAkgU3lzdGVtLk5ldC5Tb2NrZXRzLkFkZHJlc3NGYW1pbHkDAAAADgkIAwAAAAoxqH0AAAAABff///8gU3lzdGVtLk5ldC5Tb2NrZXRzLkFkZHJlc3NGYW1pbHkBAAAAB3ZhbHVlX18ACAMAAAACAAAACQoAAAAAAAAAAAAAAAAAAAAECAAAABxTeXN0ZW0uQ29sbGVjdGlvbnMuSGFzaHRhYmxlBwAAAApMb2FkRmFjdG9yB1ZlcnNpb24IQ29tcGFyZXIQSGFzaENvZGVQcm92aWRlcghIYXNoU2l6ZQRLZXlzBlZhbHVlcwAAAwMABQULCBxTeXN0ZW0uQ29sbGVjdGlvbnMuSUNvbXBhcmVyJFN5c3RlbS5Db2xsZWN0aW9ucy5JSGFzaENvZGVQcm92aWRlcgjsUTg/AAAAAAoKAwAAAAkLAAAACQwAAAAPCgAAAAgAAAAOAAAAAAAAAAAAAAAAAAAAABALAAAAAAAAABAMAAAAAAAAAAsWAgIDD2QWCAIFD2QWAgIBDw8WAh4HVmlzaWJsZWdkZAIHD2QWAgIBDw8WAh8BaGQWAgIHDzwrAAsAZAIJD2QWAgIBDw8WAh8BaGQWBAIBDzwrAAsAZAIDD2QWAgIBD2QWAmYPZBYCZg9kFgICBw9kFgJmDxBkZBYAZAILD2QWAgIBD2QWBgIBDw8WAh4EVGV4dAUKTUlCQVNJQzAwM2RkAgMPDxYCHwIFBzMuMC4wLjFkZAIFDw8WAh8CBR0xLlZpZXc8YnIgLz4yLkVkaXQ8YnIgLz40LkFkZGRkZIY06KzGLGlfYj676vUa3wV2IgNegNBXEeP2ZMYjK598"
     )
@@ -295,7 +303,7 @@ def query_barcode(session: requests.Session, barcode: str) -> str:
 
 
 def extract_repair_errorcode(html: str) -> str:
-    soup = BeautifulSoup(html, "html.parser")
+    soup = BeautifulSoup(html, HTML_PARSER)
 
     def _normalize_header(text: str) -> str:
         return " ".join(text.lower().split())
@@ -420,7 +428,7 @@ def extract_repair_errorcode(html: str) -> str:
 
 
 def extract_repair_prev_stage(html: str) -> str:
-    soup = BeautifulSoup(html, "html.parser")
+    soup = BeautifulSoup(html, HTML_PARSER)
 
     def _normalize_header(text: str) -> str:
         return " ".join(text.lower().split())
@@ -537,8 +545,8 @@ def _query_sn_with_pool(pool: queue.Queue, sn: str, log) -> tuple[str, int, str,
         pool.put(session)
 
 
-def run_yield_and_errorcode_summary(log, excel_path: str = "", workers: int = 5):
-    log("Running Repair ErrorCode summary...")
+def run_yield_and_errorcode_summary(log, excel_path: str = "", workers: int = 10):
+    log(f"Running Repair ErrorCode summary... (parser={HTML_PARSER}, workers={workers})")
 
     if excel_path:
         log(f"[Test] Loading local file: {excel_path}")
@@ -558,12 +566,15 @@ def run_yield_and_errorcode_summary(log, excel_path: str = "", workers: int = 5)
     last_df = df.groupby(SN_COL, as_index=False).tail(1).reset_index(drop=True)
     total_units = int(last_df[SN_COL].nunique())
 
-    # Build session pool
-    log(f"[Repair] Creating {workers} sessions...")
+    # Build session pool (parallel login)
+    log(f"[Repair] Creating {workers} sessions in parallel...")
     session_pool: queue.Queue[requests.Session] = queue.Queue()
-    for i in range(workers):
-        log(f"[Repair] Session {i + 1}/{workers} logging in...")
-        session_pool.put(_create_repair_session(log))
+    t0 = time.monotonic()
+    with ThreadPoolExecutor(max_workers=workers) as login_executor:
+        login_futures = [login_executor.submit(_create_repair_session, log) for _ in range(workers)]
+        for f in as_completed(login_futures):
+            session_pool.put(f.result())
+    log(f"[Repair] All {workers} sessions ready ({time.monotonic() - t0:.1f}s)")
 
     # Concurrent repair lookup per SN
     sn_list = list(dict.fromkeys(last_df[SN_COL].tolist()))  # deduplicated, order preserved
@@ -583,6 +594,7 @@ def run_yield_and_errorcode_summary(log, excel_path: str = "", workers: int = 5)
             log(f"[Repair] ({progress_counter[0]}/{total_sns}) {sn}")
         return result
 
+    t1 = time.monotonic()
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = {executor.submit(_worker, sn): sn for sn in sn_list}
         for future in as_completed(futures):
@@ -590,6 +602,8 @@ def run_yield_and_errorcode_summary(log, excel_path: str = "", workers: int = 5)
             repair_map[sn] = has_repair
             repair_error_map[sn] = repair_error
             repair_prev_stage_map[sn] = prev_stage
+    elapsed = time.monotonic() - t1
+    log(f"[Repair] Done. {total_sns} units queried in {elapsed:.1f}s ({elapsed / max(total_sns, 1):.2f}s/unit)")
 
     last_df["HasRepair"] = last_df[SN_COL].map(repair_map).fillna(0).astype(int)
     last_df["RepairErrorCode"] = last_df[SN_COL].map(repair_error_map).fillna("")
@@ -679,8 +693,8 @@ def main():
     parser.add_argument("-f", "--file", default="", help="Path to local Excel file (skip portal fetch)")
     parser.add_argument("-s", "--start-date", default="", help="Start date (YYYY-MM-DD), auto-appends 18:00")
     parser.add_argument("-e", "--end-date", default="", help="End date (YYYY-MM-DD), auto-appends 18:00")
-    parser.add_argument("-w", "--workers", type=int, default=5, choices=range(1, 11),
-                        metavar="[1-10]", help="Number of concurrent repair workers (default: 5)")
+    parser.add_argument("-w", "--workers", type=int, default=10, choices=range(1, 21),
+                        metavar="[1-20]", help="Number of concurrent repair workers (default: 10)")
     args = parser.parse_args()
 
     if not args.file and not (args.start_date and args.end_date):
