@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """CLI version of the Testing Summary Tool for WSL environments."""
 
+import os
 import sys
 import argparse
 import threading
@@ -295,196 +296,132 @@ def query_barcode(session: requests.Session, barcode: str) -> str:
     return resp.text
 
 
-def extract_repair_errorcode(html: str) -> str:
+def _normalize_header(text: str) -> str:
+    return " ".join(text.lower().split())
+
+
+def _parse_production_history(html: str) -> tuple[list[list[str]], int, int, int, int | None]:
+    """Parse Production History table from repair portal HTML.
+
+    Returns (data_rows, stage_idx, result_idx, data_idx, repair_row_idx).
+    Returns ([], -1, -1, -1, None) when table not found or invalid.
+    """
     soup = BeautifulSoup(html, HTML_PARSER)
 
-    def _normalize_header(text: str) -> str:
-        return " ".join(text.lower().split())
+    heading = soup.find(lambda tag: tag.name == "div" and "Production History" in tag.get_text())
+    if not heading:
+        return [], -1, -1, -1, None
 
-    def _find_table_after_heading(heading_text: str):
-        heading = soup.find(lambda tag: tag.name == "div" and heading_text in tag.get_text())
-        if not heading:
-            return None
-        for table in heading.find_all_next("table"):
-            header_row = table.find("tr")
-            if not header_row:
-                continue
-            headers = [
-                _normalize_header(c.get_text(" ", strip=True))
-                for c in header_row.find_all(["td", "th"])
-            ]
-            if {"stage", "result", "data"}.issubset(set(headers)):
-                return table
-        return None
-
-    def _extract_from_production_history(prod_table) -> str:
-        rows = prod_table.find_all("tr")
-        if len(rows) < 2:
-            return ""
-
-        header_cells = [c.get_text(" ", strip=True) for c in rows[0].find_all(["td", "th"])]
-        col_map = {_normalize_header(name): idx for idx, name in enumerate(header_cells)}
-        stage_idx = col_map.get("stage")
-        result_idx = col_map.get("result")
-        data_idx = col_map.get("data")
-        has_header = any(idx is not None for idx in (stage_idx, result_idx, data_idx))
-
-        data_rows = []
-        for r in rows[1:] if has_header else rows:
-            cells = [c.get_text(" ", strip=True) for c in r.find_all("td")]
-            if not cells:
-                continue
-            if not has_header and len(cells) > 7:
-                stage_idx = 4
-                result_idx = 5
-                data_idx = 7
-            if None in (stage_idx, result_idx, data_idx):
-                continue
-            if len(cells) <= max(stage_idx, result_idx, data_idx):
-                continue
-            data_rows.append(cells)
-
-        if not data_rows or None in (stage_idx, result_idx, data_idx):
-            return ""
-
-        repair_row_idx = None
-        for idx, cells in enumerate(data_rows):
-            if stage_idx is not None and len(cells) > stage_idx:
-                stage_val = cells[stage_idx]
-                if "fae repair(rn)" in stage_val.lower():
-                    repair_row_idx = idx
-                    continue
-            if any("fae repair(rn)" in c.lower() for c in cells):
-                repair_row_idx = idx
-
-        if repair_row_idx is not None and repair_row_idx > 0:
-            prev_stage = data_rows[repair_row_idx - 1][stage_idx].strip().lower()
-            if prev_stage == "pre test 1(tn)":
-                return "I2C pretest"
-
-        if repair_row_idx is None:
-            search_rows = data_rows
-        else:
-            search_rows = data_rows[:repair_row_idx]
-
-        consecutive_fail = 0
-        consecutive_candidate = ""
-        consecutive_code = ""
-        for cells in search_rows:
-            result = cells[result_idx].strip().lower()
-            data = cells[data_idx].strip()
-            if "fail" in result:
-                consecutive_fail += 1
-                if data and data.upper() != "N/A":
-                    consecutive_candidate = data
-            else:
-                consecutive_fail = 0
-            if consecutive_fail >= 3 and consecutive_candidate:
-                consecutive_code = consecutive_candidate
-        if consecutive_code:
-            return consecutive_code
-
-        for cells in reversed(search_rows):
-            result = cells[result_idx].strip().lower()
-            data = cells[data_idx].strip()
-            if "fail" in result and data and data.upper() != "N/A":
-                return data
-
-        last_data = data_rows[-1][data_idx].strip()
-        if last_data and last_data.upper() != "N/A":
-            return last_data
-
-        return ""
-
-    tables_with_stage_data = []
-    for table in soup.find_all("table"):
-        header_row = table.find("tr")
+    table = None
+    for t in heading.find_all_next("table"):
+        header_row = t.find("tr")
         if not header_row:
             continue
         headers = [
             _normalize_header(c.get_text(" ", strip=True))
             for c in header_row.find_all(["td", "th"])
         ]
-        if headers and {"stage", "data"}.issubset(set(headers)):
-            tables_with_stage_data.append(table)
+        if {"stage", "result", "data"}.issubset(set(headers)):
+            table = t
+            break
 
-    prod_table = _find_table_after_heading("Production History")
-    if prod_table:
-        tables_with_stage_data.insert(0, prod_table)
+    if not table:
+        return [], -1, -1, -1, None
 
-    for table in tables_with_stage_data:
-        code = _extract_from_production_history(table)
-        if code:
-            return code
+    rows = table.find_all("tr")
+    if len(rows) < 2:
+        return [], -1, -1, -1, None
+
+    header_cells = [c.get_text(" ", strip=True) for c in rows[0].find_all(["td", "th"])]
+    col_map = {_normalize_header(name): idx for idx, name in enumerate(header_cells)}
+    stage_idx = col_map.get("stage")
+    result_idx = col_map.get("result")
+    data_idx = col_map.get("data")
+    has_header = any(idx is not None for idx in (stage_idx, result_idx, data_idx))
+
+    data_rows: list[list[str]] = []
+    for r in rows[1:] if has_header else rows:
+        cells = [c.get_text(" ", strip=True) for c in r.find_all("td")]
+        if not cells:
+            continue
+        if not has_header and len(cells) > 7:
+            stage_idx, result_idx, data_idx = 4, 5, 7
+        if None in (stage_idx, result_idx, data_idx):
+            continue
+        if len(cells) <= max(stage_idx, result_idx, data_idx):
+            continue
+        data_rows.append(cells)
+
+    if not data_rows or None in (stage_idx, result_idx, data_idx):
+        return [], -1, -1, -1, None
+
+    # Locate "FAE Repair(RN)" row
+    repair_row_idx = None
+    for idx, cells in enumerate(data_rows):
+        if stage_idx < len(cells) and "fae repair(rn)" in cells[stage_idx].lower():
+            repair_row_idx = idx
+            continue
+        if any("fae repair(rn)" in c.lower() for c in cells):
+            repair_row_idx = idx
+
+    return data_rows, stage_idx, result_idx, data_idx, repair_row_idx
+
+
+def extract_repair_errorcode(html: str) -> str:
+    data_rows, stage_idx, result_idx, data_idx, repair_row_idx = _parse_production_history(html)
+    if not data_rows:
+        return ""
+
+    # "Pre Test 1(TN)" before repair => I2C pretest
+    if repair_row_idx is not None and repair_row_idx > 0:
+        prev_stage = data_rows[repair_row_idx - 1][stage_idx].strip().lower()
+        if prev_stage == "pre test 1(tn)":
+            return "I2C pretest"
+
+    search_rows = data_rows[:repair_row_idx] if repair_row_idx is not None else data_rows
+
+    # 3+ consecutive fails => use that error code
+    consecutive_fail = 0
+    consecutive_candidate = ""
+    consecutive_code = ""
+    for cells in search_rows:
+        result = cells[result_idx].strip().lower()
+        data = cells[data_idx].strip()
+        if "fail" in result:
+            consecutive_fail += 1
+            if data and data.upper() != "N/A":
+                consecutive_candidate = data
+        else:
+            consecutive_fail = 0
+        if consecutive_fail >= 3 and consecutive_candidate:
+            consecutive_code = consecutive_candidate
+    if consecutive_code:
+        return consecutive_code
+
+    # Last fail row before repair
+    for cells in reversed(search_rows):
+        result = cells[result_idx].strip().lower()
+        data = cells[data_idx].strip()
+        if "fail" in result and data and data.upper() != "N/A":
+            return data
+
+    # Fallback: last row data
+    last_data = data_rows[-1][data_idx].strip()
+    if last_data and last_data.upper() != "N/A":
+        return last_data
 
     return ""
 
 
 def extract_repair_prev_stage(html: str) -> str:
-    soup = BeautifulSoup(html, HTML_PARSER)
+    data_rows, stage_idx, _, _, repair_row_idx = _parse_production_history(html)
+    if not data_rows:
+        return ""
 
-    def _normalize_header(text: str) -> str:
-        return " ".join(text.lower().split())
+    if repair_row_idx is None or repair_row_idx == 0:
+        return ""
 
-    def _find_production_history_table():
-        heading = soup.find(lambda tag: tag.name == "div" and "Production History" in tag.get_text())
-        if not heading:
-            return None
-        for table in heading.find_all_next("table"):
-            header_row = table.find("tr")
-            if not header_row:
-                continue
-            headers = [
-                _normalize_header(c.get_text(" ", strip=True))
-                for c in header_row.find_all(["td", "th"])
-            ]
-            if {"stage", "result", "data"}.issubset(set(headers)):
-                return table
-        return None
-
-    def _extract_prev_stage(prod_table) -> str:
-        rows = prod_table.find_all("tr")
-        if len(rows) < 2:
-            return ""
-
-        header_cells = [c.get_text(" ", strip=True) for c in rows[0].find_all(["td", "th"])]
-        col_map = {_normalize_header(name): idx for idx, name in enumerate(header_cells)}
-        stage_idx = col_map.get("stage")
-        has_header = stage_idx is not None
-
-        data_rows = []
-        for r in rows[1:] if has_header else rows:
-            cells = [c.get_text(" ", strip=True) for c in r.find_all("td")]
-            if not cells:
-                continue
-            if stage_idx is None:
-                continue
-            if len(cells) <= stage_idx:
-                continue
-            data_rows.append(cells)
-
-        if not data_rows or stage_idx is None:
-            return ""
-
-        repair_row_idx = None
-        for idx, cells in enumerate(data_rows):
-            stage_val = cells[stage_idx]
-            if "fae repair(rn)" in stage_val.lower():
-                repair_row_idx = idx
-                continue
-            if any("fae repair(rn)" in c.lower() for c in cells):
-                repair_row_idx = idx
-
-        if repair_row_idx is None or repair_row_idx == 0:
-            return ""
-
-        return data_rows[repair_row_idx - 1][stage_idx].strip()
-
-    prod_table = _find_production_history_table()
-    if prod_table:
-        return _extract_prev_stage(prod_table)
-
-    return ""
+    return data_rows[repair_row_idx - 1][stage_idx].strip()
 
 
 def has_repair_record(session: requests.Session, sn: str, log) -> tuple[int, str, str]:
@@ -543,6 +480,8 @@ def run_yield_and_errorcode_summary(log, excel_path: str = "", workers: int = 10
 
     log(f"{'── Test Data ':─<60}")
     if excel_path:
+        if not os.path.isfile(excel_path):
+            raise FileNotFoundError(f"Excel file not found: {excel_path}")
         log(f"Loading local file: {excel_path}")
         df = pd.read_excel(excel_path)
         df = _normalize_columns(df)
@@ -589,23 +528,35 @@ def run_yield_and_errorcode_summary(log, excel_path: str = "", workers: int = 10
     progress_lock = threading.Lock()
     progress_counter = [0]
 
+    # Throttle progress: update every 10 units or on completion
+    progress_interval = max(1, min(10, total_sns // 20))
+
     def _worker(sn: str) -> tuple[str, int, str, str]:
         result = _query_sn_with_pool(session_pool, sn, log)
         with progress_lock:
             progress_counter[0] += 1
             done = progress_counter[0]
-            ts = datetime.now().strftime("%H:%M:%S")
-            print(f"\r[{ts}] Progress: {done}/{total_sns} ({done*100//total_sns}%)", end="", flush=True)
+            if done % progress_interval == 0 or done == total_sns:
+                ts = datetime.now().strftime("%H:%M:%S")
+                print(f"\r[{ts}] Progress: {done}/{total_sns} ({done*100//total_sns}%)", end="", flush=True)
         return result
 
     t1 = time.monotonic()
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = {executor.submit(_worker, sn): sn for sn in sn_list}
-        for future in as_completed(futures):
-            sn, has_repair, repair_error, prev_stage = future.result()
-            repair_map[sn] = has_repair
-            repair_error_map[sn] = repair_error
-            repair_prev_stage_map[sn] = prev_stage
+    try:
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {executor.submit(_worker, sn): sn for sn in sn_list}
+            for future in as_completed(futures):
+                sn, has_repair, repair_error, prev_stage = future.result()
+                repair_map[sn] = has_repair
+                repair_error_map[sn] = repair_error
+                repair_prev_stage_map[sn] = prev_stage
+    finally:
+        # Cleanup session pool
+        while not session_pool.empty():
+            try:
+                session_pool.get_nowait().close()
+            except queue.Empty:
+                break
     print()  # end progress line
     elapsed = time.monotonic() - t1
     log(f"Done. {total_sns} units in {elapsed:.1f}s ({elapsed / max(total_sns, 1):.2f}s/unit)")
@@ -648,18 +599,22 @@ def run_yield_and_errorcode_summary(log, excel_path: str = "", workers: int = 10
     pass_no_repair_count = int((pass_mask & (last_df["HasRepair"] == 0)).sum())
     testing_count = int(testing_mask.sum())
     pass_no_fct_repair_count = int((pass_mask & ~fct_repair_mask).sum())
+    fail_count = int(fail_mask.sum())
+    # YR(FCT) denominator: pass (excluding FCT-repaired) + fail (excluding FCT-repaired)
+    fail_no_fct_repair_count = int((fail_mask & ~fct_repair_mask).sum())
+    yr_fct_denom = pass_no_fct_repair_count + fail_no_fct_repair_count
 
     summary_df = pd.DataFrame([{
         "TotalUnits": total_units,
         "RepairedUnits": int(last_df["HasRepair"].sum()),
         "RepairedUnits(FCT)": fct_repaired_count,
         "PassUnits": pass_count,
-        "FailUnits": int(fail_mask.sum()),
+        "FailUnits": fail_count,
         "TestingUnits": testing_count,
         "FPYP": (pass_no_repair_count / total_units) if total_units else 0.0,
         "YR": (pass_count / pass_fail_count) if pass_fail_count else 0.0,
         "FPY(FCT)": (pass_no_fct_repair_count / total_units) if total_units else 0.0,
-        "YR(FCT)": (pass_no_fct_repair_count / (pass_no_fct_repair_count + int(fail_mask.sum()))) if (pass_no_fct_repair_count + int(fail_mask.sum())) else 0.0,
+        "YR(FCT)": (pass_no_fct_repair_count / yr_fct_denom) if yr_fct_denom else 0.0,
     }])
 
     # Print summary (vertical key-value layout)
