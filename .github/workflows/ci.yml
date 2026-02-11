@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [master]
   pull_request:
-    branches: [main, "feat/*"]
+    branches: [master]
 
 jobs:
   lint:
@@ -15,6 +15,8 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install dependencies
-        run: pip install pandas requests beautifulsoup4 openpyxl lxml
+        run: pip install pandas requests beautifulsoup4 openpyxl lxml tabulate ruff
       - name: Syntax check
         run: python -m py_compile Cal_FR_CLI.py
+      - name: Lint
+        run: ruff check Cal_FR_CLI.py

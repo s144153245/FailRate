@@ -18,7 +18,7 @@ python3 Cal_FR_CLI.py -s 2026-02-09 -e 2026-02-10
 python3 Cal_FR_CLI.py -f data.xlsx -w 15
 ```
 
-Requires: `pandas`, `requests`, `beautifulsoup4`, `openpyxl`. Optional: `lxml` (faster HTML parsing).
+Requires: `pandas`, `requests`, `beautifulsoup4`, `openpyxl`, `tabulate`. Optional: `lxml` (faster HTML parsing).
 
 ## Architecture
 
