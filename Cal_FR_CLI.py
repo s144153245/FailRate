@@ -166,7 +166,7 @@ def _test_get_all_records_once(log) -> tuple[dict, object]:
 
     count_resp = _test_post_json(s, TEST_COUNT_URL, payload, referer=TEST_SEARCH_PAGE)
     total = int(count_resp.get("all_record_count", 0))
-    log(f"[Test] Total records: {total} | page_count: {count_resp.get('page_count')}")
+    log(f"Total records: {total} | page_count: {count_resp.get('page_count')}")
 
     if total <= 0:
         return count_resp, None
@@ -252,7 +252,6 @@ def extract_form_fields(html, form_selector="form"):
 
 
 def login(session: requests.Session, log) -> bool:
-    log("[Repair] Loading login page...")
     resp = session.get(LOGIN_URL, verify=VERIFY_SSL)
     resp.raise_for_status()
 
@@ -270,28 +269,22 @@ def login(session: requests.Session, log) -> bool:
     login_data["txtPasswordLength"] = "10"
     login_data["txtUnencryptedPassword"] = PASSWORD_PLAIN
 
-    log("[Repair] Submitting login form...")
     resp = session.post(LOGIN_URL, data=login_data, verify=VERIFY_SSL)
     resp.raise_for_status()
 
     if "Portal/Login.aspx" in resp.url:
-        log("[Repair] Login might have failed (still on login page).")
+        log("Login might have failed (still on login page).")
         return False
 
-    log("[Repair] Login OK.")
     return True
 
 
 def query_barcode(session: requests.Session, barcode: str) -> str:
-    # Skip GET request — use hardcoded form fields directly (POST only)
-    form_data = {}
-    form_data["_EVENTTARGET"] = ""
-    form_data["_EVENTARGUMENT"] = ""
-    form_data["_VIEWSTATE"] = (
-        "/wEPDwUKLTQ4OTEwNDc2Mg8WAh4KTUlCQVNJQzAwMzLABgABAAAA/////wEAAAAAAAAADAIAAABBTUlCQVNJQzAwMCwgVmVyc2lvbj0zLjAuMC41LCBDdWx0dXJlPW5ldXRyYWwsIFB1YmxpY0tleVRva2VuPW51bGwMAwAAAElTeXN0ZW0sIFZlcnNpb249NC4wLjAuMCwgQ3VsdHVyZT1uZXV0cmFsLCBQdWJsaWNLZXlUb2tlbj1iNzdhNWM1NjE5MzRlMDg5BQEAAAAUTUlCQVNJQzAwMC5jbHNQdWJsaWMGAAAACG1fdXNlcmlkB21fc0RhdGUMbV9zUmVzdWx0U1FMBG1fSVAHbV9VU05fWBdtX1VzblVuUGFja2FnZUhhc2hUYWJsZQEBAQQBAxRTeXN0ZW0uTmV0LklQQWRkcmVzcwMAAAAcU3lzdGVtLkNvbGxlY3Rpb25zLkhhc2h0YWJsZQIAAAAGBAAAAAgxMTEwOTExNwYFAAAAAAkFAAAACQYAAAAJBQAAAAkIAAAABQYAAAAUU3lzdGVtLk5ldC5JUEFkZHJlc3MFAAAACW1fQWRkcmVzcwhtX0ZhbWlseQltX051bWJlcnMJbV9TY29wZUlkCm1fSGFzaENvZGUABAcAAAkgU3lzdGVtLk5ldC5Tb2NrZXRzLkFkZHJlc3NGYW1pbHkDAAAADgkIAwAAAAoxqH0AAAAABff///8gU3lzdGVtLk5ldC5Tb2NrZXRzLkFkZHJlc3NGYW1pbHkBAAAAB3ZhbHVlX18ACAMAAAACAAAACQoAAAAAAAAAAAAAAAAAAAAECAAAABxTeXN0ZW0uQ29sbGVjdGlvbnMuSGFzaHRhYmxlBwAAAApMb2FkRmFjdG9yB1ZlcnNpb24IQ29tcGFyZXIQSGFzaENvZGVQcm92aWRlcghIYXNoU2l6ZQRLZXlzBlZhbHVlcwAAAwMABQULCBxTeXN0ZW0uQ29sbGVjdGlvbnMuSUNvbXBhcmVyJFN5c3RlbS5Db2xsZWN0aW9ucy5JSGFzaENvZGVQcm92aWRlcgjsUTg/AAAAAAoKAwAAAAkLAAAACQwAAAAPCgAAAAgAAAAOAAAAAAAAAAAAAAAAAAAAABALAAAAAAAAABAMAAAAAAAAAAsWAgIDD2QWCAIFD2QWAgIBDw8WAh4HVmlzaWJsZWdkZAIHD2QWAgIBDw8WAh8BaGQWAgIHDzwrAAsAZAIJD2QWAgIBDw8WAh8BaGQWBAIBDzwrAAsAZAIDD2QWAgIBD2QWAmYPZBYCZg9kFgICBw9kFgJmDxBkZBYAZAILD2QWAgIBD2QWBgIBDw8WAh4EVGV4dAUKTUlCQVNJQzAwM2RkAgMPDxYCHwIFBzMuMC4wLjFkZAIFDw8WAh8CBR0xLlZpZXc8YnIgLz4yLkVkaXQ8YnIgLz40LkFkZGRkZIY06KzGLGlfYj676vUa3wV2IgNegNBXEeP2ZMYjK598"
-    )
-    form_data["_VIEWSTATEGENERATOR"] = "61BD1585"
-    form_data["uxMainMenu"] = "0"
+    # GET first to establish server-side session state (required by ASP.NET WebForms)
+    resp = session.get(BARCODE_URL, verify=VERIFY_SSL)
+    resp.raise_for_status()
+
+    form_data = extract_form_fields(resp.text)
     form_data["ddlFltMFGTYPE"] = "FA"
     form_data["rblFltTYPE"] = "USN"
     form_data["txtFltBARCODE"] = barcode
@@ -503,7 +496,7 @@ def has_repair_record(session: requests.Session, sn: str, log) -> tuple[int, str
         prev_stage = extract_repair_prev_stage(html) if has_repair else ""
         return has_repair, error_code, prev_stage
     except Exception as e:
-        log(f"[Repair] Error querying {sn}: {e}")
+        log(f"Error querying {sn}: {e}")
         return 0, "", ""
 # ------------------------------------------------------------ #
 
@@ -548,12 +541,13 @@ def _query_sn_with_pool(pool: queue.Queue, sn: str, log) -> tuple[str, int, str,
 def run_yield_and_errorcode_summary(log, excel_path: str = "", workers: int = 10):
     log(f"Running Repair ErrorCode summary... (parser={HTML_PARSER}, workers={workers})")
 
+    log(f"{'── Test Data ':─<60}")
     if excel_path:
-        log(f"[Test] Loading local file: {excel_path}")
+        log(f"Loading local file: {excel_path}")
         df = pd.read_excel(excel_path)
         df = _normalize_columns(df)
     else:
-        log("[Test] Fetching test records from portal...")
+        log("Fetching test records from portal...")
         _, records = _test_get_all_records_once(log)
         df = _records_to_dataframe(records)
         df = _normalize_columns(df)
@@ -567,14 +561,22 @@ def run_yield_and_errorcode_summary(log, excel_path: str = "", workers: int = 10
     total_units = int(last_df[SN_COL].nunique())
 
     # Build session pool (parallel login)
-    log(f"[Repair] Creating {workers} sessions in parallel...")
+    log(f"{'── Repair Lookup ':─<60}")
+    log(f"Logging in {workers} sessions...")
     session_pool: queue.Queue[requests.Session] = queue.Queue()
     t0 = time.monotonic()
+    login_done = [0]
+    login_lock = threading.Lock()
     with ThreadPoolExecutor(max_workers=workers) as login_executor:
         login_futures = [login_executor.submit(_create_repair_session, log) for _ in range(workers)]
         for f in as_completed(login_futures):
             session_pool.put(f.result())
-    log(f"[Repair] All {workers} sessions ready ({time.monotonic() - t0:.1f}s)")
+            with login_lock:
+                login_done[0] += 1
+                ts = datetime.now().strftime("%H:%M:%S")
+                print(f"\r[{ts}] Sessions ready: {login_done[0]}/{workers}", end="", flush=True)
+    print()  # end progress line
+    log(f"All {workers} sessions ready ({time.monotonic() - t0:.1f}s)")
 
     # Concurrent repair lookup per SN
     sn_list = list(dict.fromkeys(last_df[SN_COL].tolist()))  # deduplicated, order preserved
@@ -582,7 +584,7 @@ def run_yield_and_errorcode_summary(log, excel_path: str = "", workers: int = 10
     repair_error_map = {}
     repair_prev_stage_map = {}
     total_sns = len(sn_list)
-    log(f"[Repair] Checking repair records for {total_sns} units with {workers} workers...")
+    log(f"Checking {total_sns} units with {workers} workers...")
 
     progress_lock = threading.Lock()
     progress_counter = [0]
@@ -591,7 +593,9 @@ def run_yield_and_errorcode_summary(log, excel_path: str = "", workers: int = 10
         result = _query_sn_with_pool(session_pool, sn, log)
         with progress_lock:
             progress_counter[0] += 1
-            log(f"[Repair] ({progress_counter[0]}/{total_sns}) {sn}")
+            done = progress_counter[0]
+            ts = datetime.now().strftime("%H:%M:%S")
+            print(f"\r[{ts}] Progress: {done}/{total_sns} ({done*100//total_sns}%)", end="", flush=True)
         return result
 
     t1 = time.monotonic()
@@ -602,62 +606,97 @@ def run_yield_and_errorcode_summary(log, excel_path: str = "", workers: int = 10
             repair_map[sn] = has_repair
             repair_error_map[sn] = repair_error
             repair_prev_stage_map[sn] = prev_stage
+    print()  # end progress line
     elapsed = time.monotonic() - t1
-    log(f"[Repair] Done. {total_sns} units queried in {elapsed:.1f}s ({elapsed / max(total_sns, 1):.2f}s/unit)")
+    log(f"Done. {total_sns} units in {elapsed:.1f}s ({elapsed / max(total_sns, 1):.2f}s/unit)")
 
     last_df["HasRepair"] = last_df[SN_COL].map(repair_map).fillna(0).astype(int)
     last_df["RepairErrorCode"] = last_df[SN_COL].map(repair_error_map).fillna("")
     last_df["PrevRepairStage"] = last_df[SN_COL].map(repair_prev_stage_map).fillna("")
 
-    # ErrorCode summary for repaired units only
+    # FCT stage filter
+    fct_stage_codes = {"nh", "nx", "n2", "tp", "ni", "ua"}
+    prev_stage_code = (
+        last_df["PrevRepairStage"]
+        .astype(str)
+        .str.strip()
+        .str.lower()
+        .str.extract(r"\((\w+)\)$", expand=False)
+        .fillna("")
+    )
+    fct_repair_mask = (last_df["HasRepair"] == 1) & prev_stage_code.isin(fct_stage_codes)
+    fct_repaired_count = int(fct_repair_mask.sum())
+
+    # ErrorCode summary for all repaired units
     ec_repair = _errorcode_summary(last_df, last_df["HasRepair"] == 1, total_units, error_col="RepairErrorCode")
     if "RepairErrorCode" in ec_repair.columns and ERROR_COL not in ec_repair.columns:
         ec_repair.rename(columns={"RepairErrorCode": ERROR_COL}, inplace=True)
 
+    # ErrorCode summary for FCT repaired units only
+    ec_repair_fct = _errorcode_summary(last_df, fct_repair_mask, total_units, error_col="RepairErrorCode")
+    if "RepairErrorCode" in ec_repair_fct.columns and ERROR_COL not in ec_repair_fct.columns:
+        ec_repair_fct.rename(columns={"RepairErrorCode": ERROR_COL}, inplace=True)
+
     # Serial number listing (repaired units only)
     sn_cols = [SN_COL, STATUS_COL, STAGE_COL, TIME_COL, "HasRepair", "RepairErrorCode", "PrevRepairStage"]
     sn_repair = last_df[last_df["HasRepair"] == 1][sn_cols].copy()
+    sn_repair_fct = last_df[fct_repair_mask][sn_cols].copy()
 
     pass_mask, fail_mask, testing_mask = _status_masks(last_df[STATUS_COL])
     pass_count = int(pass_mask.sum())
     pass_fail_count = int((pass_mask | fail_mask).sum())
     pass_no_repair_count = int((pass_mask & (last_df["HasRepair"] == 0)).sum())
-
     testing_count = int(testing_mask.sum())
-    prev_stage_set = {
-        "flash(nh)",
-        "flc(nx)",
-        "finaltest3(ua)",
-        "fct1(n2)",
-        "finaltest1(tp)",
-    }
-    prev_stage_norm = (
-        last_df["PrevRepairStage"]
-        .astype(str)
-        .str.strip()
-        .str.lower()
-        .str.replace(r"\s+", "", regex=True)
-    )
-    test_repaired_count = int(
-        ((last_df["HasRepair"] == 1) & prev_stage_norm.isin(prev_stage_set)).sum()
-    )
+    pass_no_fct_repair_count = int((pass_mask & ~fct_repair_mask).sum())
 
     summary_df = pd.DataFrame([{
         "TotalUnits": total_units,
         "RepairedUnits": int(last_df["HasRepair"].sum()),
+        "RepairedUnits(FCT)": fct_repaired_count,
         "PassUnits": pass_count,
         "FailUnits": int(fail_mask.sum()),
         "TestingUnits": testing_count,
         "FPYP": (pass_no_repair_count / total_units) if total_units else 0.0,
         "YR": (pass_count / pass_fail_count) if pass_fail_count else 0.0,
+        "FPY(FCT)": (pass_no_fct_repair_count / total_units) if total_units else 0.0,
+        "YR(FCT)": (pass_no_fct_repair_count / (pass_no_fct_repair_count + int(fail_mask.sum()))) if (pass_no_fct_repair_count + int(fail_mask.sum())) else 0.0,
     }])
 
-    # Print summary
-    log("=== SUMMARY ===")
-    log(summary_df.to_string(index=False))
+    # Print summary (vertical key-value layout)
+    log("")
+    log("=" * 60)
+    log("  SUMMARY")
+    log("=" * 60)
+    rate_keys = {"FPYP", "YR", "FPY(FCT)", "YR(FCT)"}
+    for col in summary_df.columns:
+        val = summary_df[col].iloc[0]
+        if col in rate_keys:
+            val_str = f"{val * 100:.2f}%"
+        else:
+            val_str = str(int(val))
+        log(f"  {col:<22s}: {val_str:>8s}")
+    log("=" * 60)
 
-    log("\n=== ERRORCODES (Repaired Units Only) ===")
-    log(ec_repair.to_string(index=False) if not ec_repair.empty else "No repaired units with ErrorCode.")
+    def _print_ec_table(ec_df: pd.DataFrame):
+        if ec_df.empty:
+            log("  (none)")
+            return
+        display = ec_df.reset_index(drop=True)
+        display.insert(0, "#", range(1, len(display) + 1))
+        display["FailRate(%)"] = display["FailRate(%)"].map(lambda x: f"{x:.2f}")
+        for line in display.to_string(index=False).splitlines():
+            log(line)
+
+    log("")
+    log("-" * 60)
+    log("  ERRORCODES — All Repaired Units")
+    log("-" * 60)
+    _print_ec_table(ec_repair)
+    log("")
+    log("-" * 60)
+    log(f"  ERRORCODES — FCT Repaired Units ({'/'.join(sorted(fct_stage_codes, key=str.upper))})")
+    log("-" * 60)
+    _print_ec_table(ec_repair_fct)
 
     # Save Excel
     ts = datetime.now().strftime("%Y%m%d%H%M")
@@ -667,14 +706,17 @@ def run_yield_and_errorcode_summary(log, excel_path: str = "", workers: int = 10
         excel_last_df = last_df.drop(columns=[c for c in [ERROR_COL] if c in last_df.columns])
         excel_last_df.to_excel(excel_writer=writer, sheet_name="Last_Record_Per_SN", index=False)
         ec_repair.to_excel(excel_writer=writer, sheet_name="ErrorCode_Repaired", index=False)
+        ec_repair_fct.to_excel(excel_writer=writer, sheet_name="ErrorCode_Repaired(FCT)", index=False)
         sn_repair.to_excel(excel_writer=writer, sheet_name="SN_Repaired", index=False)
+        sn_repair_fct.to_excel(excel_writer=writer, sheet_name="SN_Repaired(FCT)", index=False)
 
     log(f"Saved: {out_name}")
     return out_name
 
 
 def log(msg: str):
-    print(msg, flush=True)
+    ts = datetime.now().strftime("%H:%M:%S")
+    print(f"[{ts}] {msg}", flush=True)
 
 
 def _validate_date(date_str: str) -> str:
@@ -702,10 +744,10 @@ def main():
 
     if args.start_date:
         TEST_START_TIME = _validate_date(args.start_date)
-        log(f"[Config] Start time: {TEST_START_TIME}")
+        log(f"Start time: {TEST_START_TIME}")
     if args.end_date:
         TEST_END_TIME = _validate_date(args.end_date)
-        log(f"[Config] End time: {TEST_END_TIME}")
+        log(f"End time: {TEST_END_TIME}")
 
     try:
         run_yield_and_errorcode_summary(log, excel_path=args.file, workers=args.workers)
