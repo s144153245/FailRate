@@ -1,5 +1,38 @@
 #!/usr/bin/env python3
-"""CLI version of the Testing Summary Tool for WSL environments."""
+"""Manufacturing yield & fail-rate CLI tool for Wistron test data.
+
+Architecture / Data Flow
+========================
+1. **Test Data Portal** (Django, CSRF-protected HTTP API)
+   - Authenticate via GET (extract csrftoken) -> POST login
+   - Fetch paginated JSON test records filtered by product, stage, date range
+   - Convert JSON -> pandas DataFrame, normalize column names
+
+2. **Repair Portal** (ASP.NET WebForms with ViewState)
+   - Login via form POST with ViewState + credentials
+   - For each serial number, POST barcode query -> parse "Production History" HTML table
+   - Extract: has_repair flag, error code (heuristic), FCT-specific error code, previous stage
+
+3. **Analysis Pipeline** (pandas)
+   - Keep last test record per serial number (sort by time, groupby tail)
+   - Join repair data (HasRepair, RepairErrorCode, RepairErrorCodeFCT, PrevRepairStage)
+   - Compute yield metrics: FPYP, YR, FPY(FCT), YR(FCT)
+   - Compute per-stage fail rates and error code rankings from raw test data
+   - Compute repair-sourced error code summaries (all repaired + FCT-only)
+
+4. **Output**
+   - CLI: formatted tables via tabulate (rounded_grid)
+   - Excel: multi-sheet workbook with summary, detail, and ranking sheets
+
+Subsystem Dependencies
+----------------------
+- Test Portal helpers: _test_* functions, _records_to_dataframe, _normalize_columns
+- Repair Portal helpers: extract_form_fields, login, query_barcode, _parse_production_history,
+  extract_repair_errorcode, extract_repair_prev_stage, has_repair_record
+- Analysis: _status_masks (shared), _stage_failrate_summary, _stage_errorcode_ranking,
+  _errorcode_summary, run_yield_and_errorcode_summary
+- CLI: main, log, _validate_datetime
+"""
 
 import os
 import sys
@@ -13,6 +46,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 import time
 from bs4 import BeautifulSoup
+from tabulate import tabulate
 from requests.packages.urllib3.exceptions import InsecureRequestWarning
 
 requests.packages.urllib3.disable_warnings(category=InsecureRequestWarning)
@@ -72,6 +106,16 @@ STATUS_TESTING_VALUES = {"testing", "2"}
 
 
 def _status_masks(series: pd.Series) -> tuple[pd.Series, pd.Series, pd.Series]:
+    """Create boolean masks classifying test status as pass/fail/testing.
+
+    Normalizes the series to lowercase, then matches against STATUS_PASS_VALUES,
+    STATUS_FAIL_VALUES, STATUS_TESTING_VALUES (exact match) plus substring fallback
+    (e.g. "pass" in "pass_with_warning"). Used by both per-stage analysis and yield
+    metric computation.
+
+    Returns:
+        (pass_mask, fail_mask, testing_mask) — each a boolean pd.Series aligned to input.
+    """
     status = series.astype(str).str.strip().str.lower()
     pass_mask = status.isin(STATUS_PASS_VALUES) | status.str.contains("pass", na=False)
     fail_mask = status.isin(STATUS_FAIL_VALUES) | status.str.contains("fail", na=False)
@@ -80,6 +124,10 @@ def _status_masks(series: pd.Series) -> tuple[pd.Series, pd.Series, pd.Series]:
 
 
 def _test_browser_session() -> requests.Session:
+    """Create a requests.Session with browser-like User-Agent header.
+
+    The test data portal rejects requests without a realistic UA string.
+    """
     s = requests.Session()
     s.headers.update({
         "User-Agent": (
@@ -92,6 +140,12 @@ def _test_browser_session() -> requests.Session:
 
 
 def _test_login_and_get_session(username: str, password: str) -> requests.Session:
+    """Authenticate with the Django test data portal using CSRF flow.
+
+    Flow: GET login page -> extract csrftoken cookie -> POST credentials with
+    CSRF token in both form data and header -> follow redirect -> GET base URL
+    to finalize session. Returns an authenticated Session for subsequent API calls.
+    """
     s = _test_browser_session()
 
     r0 = s.get(TEST_LOGIN_URL, timeout=30)
@@ -121,6 +175,11 @@ def _test_login_and_get_session(username: str, password: str) -> requests.Sessio
 
 
 def _test_csrf_headers(s: requests.Session, referer: str) -> dict:
+    """Build AJAX request headers with CSRF token for the test data portal.
+
+    Extracts csrftoken from session cookies and returns headers dict suitable
+    for XMLHttpRequest-style POST calls (JSON responses).
+    """
     csrf = s.cookies.get("csrftoken")
     if not csrf:
         raise RuntimeError("csrftoken missing; login likely failed")
@@ -138,6 +197,12 @@ def _test_csrf_headers(s: requests.Session, referer: str) -> dict:
 
 
 def _test_base_payload() -> dict:
+    """Build the default query payload for the test data portal search API.
+
+    Uses module-level constants (TEST_PRODUCT_NAMES, TEST_STAGES, TEST_STATUS,
+    TEST_START_TIME, TEST_END_TIME) as filter criteria. The caller overrides
+    page_length and queryTestRecordId as needed for pagination.
+    """
     return {
         "part_number": "",
         "product_name[]": TEST_PRODUCT_NAMES,
@@ -160,12 +225,19 @@ def _test_base_payload() -> dict:
 
 
 def _test_post_json(s: requests.Session, url: str, payload: dict, referer: str):
+    """POST form-encoded payload to the test portal and return parsed JSON response."""
     r = s.post(url, data=payload, headers=_test_csrf_headers(s, referer), timeout=60)
     r.raise_for_status()
     return r.json()
 
 
 def _test_get_all_records_once(log) -> tuple[dict, object]:
+    """Fetch all test records from the portal in a single paginated request.
+
+    Steps: login -> get total count -> set page_length to min(total, cap) ->
+    fetch all records in one POST. Returns (count_response, records_response).
+    records_response is None when total <= 0.
+    """
     s = _test_login_and_get_session(TEST_USERNAME, TEST_PASSWORD)
     payload = _test_base_payload()
 
@@ -186,6 +258,12 @@ def _test_get_all_records_once(log) -> tuple[dict, object]:
 
 
 def _records_to_dataframe(records: object) -> pd.DataFrame:
+    """Convert JSON test records (list or dict with nested list) to DataFrame.
+
+    Handles multiple response formats: bare list, or dict with data under keys
+    like "data", "records", "rows", "result", "items", "ret_lis", "data_list".
+    Returns empty DataFrame for None input.
+    """
     if records is None:
         return pd.DataFrame()
 
@@ -209,6 +287,13 @@ def _records_to_dataframe(records: object) -> pd.DataFrame:
 
 
 def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Rename DataFrame columns to canonical names (SN_COL, TIME_COL, etc.).
+
+    Maps common column name variants (e.g. "serial_number", "sn", "usn") to the
+    standard names used throughout the pipeline. ErrorCode column is optional.
+    Raises ValueError if required columns (SerialNumber, StartTime, TestStatus,
+    Stage) cannot be found.
+    """
     if df.empty:
         return df
 
@@ -249,6 +334,11 @@ def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 # ------------------ REPAIR PORTAL HELPERS ------------------ #
 def extract_form_fields(html, form_selector="form"):
+    """Extract all hidden input fields from an HTML form (ASP.NET ViewState etc.).
+
+    Parses the first form matching form_selector and returns a dict of
+    {input_name: input_value} for all <input> elements with a name attribute.
+    """
     soup = BeautifulSoup(html, HTML_PARSER)
     form = soup.select_one(form_selector)
     if not form:
@@ -262,6 +352,12 @@ def extract_form_fields(html, form_selector="form"):
 
 
 def login(session: requests.Session, log) -> bool:
+    """Log into the ASP.NET WebForms repair portal.
+
+    Flow: GET login page -> extract form fields (ViewState) -> override with
+    hardcoded EventValidation + credentials -> POST. Returns True if login
+    succeeded (URL no longer on login page), False otherwise.
+    """
     resp = session.get(LOGIN_URL, verify=VERIFY_SSL)
     resp.raise_for_status()
 
@@ -290,6 +386,12 @@ def login(session: requests.Session, log) -> bool:
 
 
 def query_barcode(session: requests.Session, barcode: str) -> str:
+    """Query the repair portal for a serial number's production history.
+
+    GETs the barcode page first (required to establish ASP.NET server-side state),
+    then POSTs the barcode query. Returns raw HTML response containing the
+    Production History table.
+    """
     # GET first to establish server-side session state (required by ASP.NET WebForms)
     resp = session.get(BARCODE_URL, verify=VERIFY_SSL)
     resp.raise_for_status()
@@ -306,6 +408,7 @@ def query_barcode(session: requests.Session, barcode: str) -> str:
 
 
 def _normalize_header(text: str) -> str:
+    """Normalize HTML table header text: lowercase, collapse whitespace."""
     return " ".join(text.lower().split())
 
 
@@ -383,6 +486,26 @@ def _extract_stage_code(stage_text: str) -> str:
 
 
 def extract_repair_errorcode(html: str, stage_filter: set[str] | None = None) -> str:
+    """Extract the most relevant error code from a unit's repair production history.
+
+    Heuristic (applied to rows before the "FAE Repair(RN)" row):
+    1. Special case: if the row immediately before repair is "Pre Test 1(TN)",
+       return "I2C pretest" (only when no stage_filter).
+    2. If stage_filter is set, restrict search rows to matching FCT stages.
+    3. "3+ consecutive fails" rule: scan forward; if 3+ consecutive fail results
+       are found, use the last non-N/A error code from that streak.
+    4. "Last fail before repair" fallback: scan backward from repair row for the
+       last fail with a non-N/A data field.
+    5. Final fallback: return the data field of the last row.
+
+    Args:
+        html: Raw HTML from query_barcode() containing Production History table.
+        stage_filter: If set (e.g. FCT_STAGE_CODES), only consider rows whose
+            stage code (extracted via _extract_stage_code) is in this set.
+
+    Returns:
+        Error code string, or "" if no meaningful code found.
+    """
     data_rows, stage_idx, result_idx, data_idx, repair_row_idx = _parse_production_history(html)
     if not data_rows:
         return ""
@@ -440,6 +563,11 @@ def extract_repair_errorcode(html: str, stage_filter: set[str] | None = None) ->
 
 
 def extract_repair_prev_stage(html: str) -> str:
+    """Extract the test stage immediately before "FAE Repair(RN)" in production history.
+
+    Returns the stage text of the row just before the repair row, or "" if no
+    repair row exists or it's the first row.
+    """
     data_rows, stage_idx, _, _, repair_row_idx = _parse_production_history(html)
     if not data_rows:
         return ""
@@ -451,6 +579,15 @@ def extract_repair_prev_stage(html: str) -> str:
 
 
 def has_repair_record(session: requests.Session, sn: str, log) -> tuple[int, str, str, str]:
+    """Check if a serial number has a repair record and extract repair details.
+
+    Queries the repair portal, checks for "FAE Repair(RN)" in the response,
+    then extracts error codes (all-stage and FCT-only) and previous repair stage.
+
+    Returns:
+        (has_repair, error_code, error_code_fct, prev_stage) where has_repair is
+        0 or 1, and the rest are strings (empty if no repair).
+    """
     try:
         html = query_barcode(session, sn)
         html_lower = html.lower()
@@ -521,6 +658,12 @@ def _errorcode_summary(
     total_units: int,
     error_col: str = ERROR_COL,
 ) -> pd.DataFrame:
+    """Generic error code frequency summary for a filtered subset of units.
+
+    Filters df_last by mask, groups by error_col, counts occurrences, computes
+    FailRate(%) = Count/total_units*100. Used for both all-repaired and
+    FCT-repaired error code summaries.
+    """
     if error_col not in df_last.columns:
         return pd.DataFrame(columns=[error_col, "Count", "FailRate(%)"])
 
@@ -554,6 +697,36 @@ def _query_sn_with_pool(pool: queue.Queue, sn: str, log) -> tuple[str, int, str,
 
 
 def run_yield_and_errorcode_summary(log, excel_path: str = "", workers: int = 10):
+    """Main analysis pipeline: fetch data, query repairs, compute metrics, output results.
+
+    Pipeline stages:
+    1. Load test data (from Excel file or portal API)
+    2. Normalize columns to canonical names
+    3. Keep last record per serial number (sort by StartTime, groupby tail)
+    4. Compute per-stage fail rate and error code rankings from raw test data
+    5. Create repair portal session pool (parallel login)
+    6. Concurrently query repair status for each unique SN
+    7. Join repair data onto last_df (HasRepair, RepairErrorCode, etc.)
+    8. Compute yield metrics:
+       - FPYP = pass_without_any_repair / total_units
+       - YR = pass / (pass + fail)
+       - FPY(FCT) = pass_without_fct_repair / total_units
+       - YR(FCT) = pass_no_fct / (pass_no_fct + fail_no_fct)
+    9. Print CLI tables (tabulate rounded_grid format)
+    10. Export multi-sheet Excel workbook
+
+    Args:
+        log: Callable for timestamped logging (typically the module-level log()).
+        excel_path: Path to local Excel file. If empty, fetches from test data portal.
+        workers: Number of concurrent repair portal query sessions (1-20).
+
+    Returns:
+        Output Excel filename (str).
+
+    Side effects:
+        - Writes Excel file to current directory
+        - Prints tables and progress to stdout
+    """
     log(f"Running Repair ErrorCode summary... (parser={HTML_PARSER}, workers={workers})")
 
     log(f"{'── Test Data ':─<60}")
@@ -591,7 +764,10 @@ def run_yield_and_errorcode_summary(log, excel_path: str = "", workers: int = 10
             disp.insert(0, "#", range(1, len(disp) + 1))
         if "FailRate(%)" in disp.columns:
             disp["FailRate(%)"] = disp["FailRate(%)"].map(lambda x: f"{x:.2f}")
-        for line in disp.to_string(index=False).splitlines():
+        right_cols = {"#", "Total", "Pass", "Fail", "Count", "FailRate(%)"}
+        colalign = tuple("right" if c in right_cols else "left" for c in disp.columns)
+        table = tabulate(disp.values, headers=disp.columns, tablefmt="rounded_grid", colalign=colalign)
+        for line in table.splitlines():
             log(f"{indent}{line}")
 
     def _section(title: str, subtitle: str = ""):
@@ -724,6 +900,7 @@ def run_yield_and_errorcode_summary(log, excel_path: str = "", workers: int = 10
     fail_no_fct_repair_count = int((fail_mask & ~fct_repair_mask).sum())
     yr_fct_denom = pass_no_fct_repair_count + fail_no_fct_repair_count
 
+    # --- Yield metric computation ---
     summary_df = pd.DataFrame([{
         "TotalUnits": total_units,
         "RepairedUnits": int(last_df["HasRepair"].sum()),
@@ -737,20 +914,18 @@ def run_yield_and_errorcode_summary(log, excel_path: str = "", workers: int = 10
         "YR(FCT)": (pass_no_fct_repair_count / yr_fct_denom) if yr_fct_denom else 0.0,
     }])
 
-    # Print summary (vertical key-value layout)
-    log("")
-    log("=" * 60)
-    log("  SUMMARY")
-    log("=" * 60)
+    # Print summary as tabulate table (vertical key-value layout)
     rate_keys = {"FPYP", "YR", "FPY(FCT)", "YR(FCT)"}
+    summary_rows = []
     for col in summary_df.columns:
         val = summary_df[col].iloc[0]
-        if col in rate_keys:
-            val_str = f"{val * 100:.2f}%"
-        else:
-            val_str = str(int(val))
-        log(f"  {col:<22s}: {val_str:>8s}")
-    log("=" * 60)
+        val_str = f"{val * 100:.2f}%" if col in rate_keys else str(int(val))
+        summary_rows.append([col, val_str])
+    _section("SUMMARY")
+    table = tabulate(summary_rows, headers=["Metric", "Value"],
+                     tablefmt="rounded_grid", colalign=("left", "right"))
+    for line in table.splitlines():
+        log(f"  {line}")
 
     _section("ERRORCODES — All Repaired Units",
              "(Data source: Repair portal — units with FAE Repair(RN) record)")
@@ -780,6 +955,7 @@ def run_yield_and_errorcode_summary(log, excel_path: str = "", workers: int = 10
 
 
 def log(msg: str):
+    """Print a timestamped log message to stdout (format: [HH:MM:SS] msg)."""
     ts = datetime.now().strftime("%H:%M:%S")
     print(f"[{ts}] {msg}", flush=True)
 
@@ -805,6 +981,7 @@ def _validate_datetime(date_str: str) -> str:
 
 
 def main():
+    """CLI entry point: parse args, set date range, invoke analysis pipeline."""
     global TEST_START_TIME, TEST_END_TIME
 
     parser = argparse.ArgumentParser(description="Testing Summary Tool (CLI)")

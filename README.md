@@ -2,10 +2,35 @@
 
 Manufacturing yield and fail-rate analysis tool for Wistron test data.
 
+## Architecture
+
+```
+                          Cal_FR_CLI.py
+                               |
+            +------------------+------------------+
+            |                                     |
+    Test Data Portal                      Repair Portal
+    (Django, HTTP API)                  (ASP.NET WebForms)
+            |                                     |
+     JSON test records               Production History HTML
+            |                                     |
+            +------------------+------------------+
+                               |
+                     pandas DataFrame join
+                               |
+              +----------------+----------------+
+              |                |                |
+        Yield Metrics    ErrorCode Summary   Per-Stage Summary
+              |                |                |
+              +----------------+----------------+
+                               |
+                  CLI tables (tabulate) + Excel export
+```
+
 ## Requirements
 
 ```bash
-pip install pandas requests beautifulsoup4 openpyxl
+pip install pandas requests beautifulsoup4 openpyxl tabulate
 # Optional: pip install lxml  (faster HTML parsing)
 ```
 
@@ -30,11 +55,24 @@ python3 Cal_FR_CLI.py -f data.xlsx -w 1
 | Flag | Description | Required |
 |------|-------------|----------|
 | `-f` / `--file` | Path to local Excel file (skips portal fetch) | Either `-f` or both `-s`/`-e` |
-| `-s` / `--start-date` | Start date (`YYYY-MM-DD`, time fixed at 18:00) | With `-e` when no `-f` |
-| `-e` / `--end-date` | End date (`YYYY-MM-DD`, time fixed at 18:00) | With `-s` when no `-f` |
+| `-s` / `--start-date` | Start date (`YYYY-MM-DD`, time defaults to 18:00) | With `-e` when no `-f` |
+| `-e` / `--end-date` | End date (`YYYY-MM-DD`, time defaults to 18:00) | With `-s` when no `-f` |
 | `-w` / `--workers` | Concurrent repair query workers (default: 10, range: 1-20) | No |
 
 ## Output
+
+### CLI Tables
+
+The tool prints formatted tables to the terminal using `tabulate` (`rounded_grid` format):
+
+- **Per-Stage Summary** — pass/fail/total/fail-rate per test stage
+- **ErrorCode Ranking (All Stages)** — error code frequency from raw test data
+- **ErrorCode Ranking by Stage** — error code frequency broken down per stage
+- **Summary** — vertical key-value table of all yield metrics
+- **ErrorCodes (All Repaired)** — error codes from repair portal data
+- **ErrorCodes (FCT Repaired)** — error codes for FCT-stage repairs only
+
+### Excel File
 
 Generates `yield_errorcode_summary_YYYYMMDDHHMM.xlsx` with sheets:
 
@@ -44,6 +82,9 @@ Generates `yield_errorcode_summary_YYYYMMDDHHMM.xlsx` with sheets:
 - **ErrorCode_Repaired(FCT)** — Error code frequency for FCT-stage repaired units
 - **SN_Repaired** — Detail listing of all repaired serial numbers
 - **SN_Repaired(FCT)** — Detail listing of FCT-stage repaired serial numbers
+- **Stage_FailRate** — Per-stage pass/fail/total/fail-rate from raw test data
+- **Stage_ErrorCode_All** — Error code ranking across all stages
+- **Stage_ErrorCode** — Error code ranking broken down per stage
 
 ## Yield Metrics
 
@@ -55,3 +96,13 @@ Generates `yield_errorcode_summary_YYYYMMDDHHMM.xlsx` with sheets:
 | **YR(FCT)** | Pass units without FCT repair / (Pass without FCT repair + Fail without FCT repair) |
 
 FCT stages: NH, NX, N2, TP, NI, UA
+
+## Troubleshooting
+
+| Issue | Solution |
+|-------|----------|
+| Connection timeout / refused | Ensure VPN is connected to Wistron internal network |
+| Login failed (still on login page) | Credentials may have expired; update `USER_ID` / `PASSWORD_HASH` / `PASSWORD_PLAIN` in script |
+| `ModuleNotFoundError: lxml` | Install with `pip install lxml`, or ignore (falls back to `html.parser`) |
+| `Missing column in test file` | Excel column names changed; check `_normalize_columns()` candidate list |
+| Slow repair lookups | Increase workers with `-w 15` or `-w 20` |
