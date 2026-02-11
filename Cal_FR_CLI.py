@@ -3,6 +3,7 @@
 
 import os
 import sys
+import re
 import argparse
 import threading
 import queue
@@ -30,6 +31,9 @@ STATUS_COL = "TestStatus"
 STAGE_COL = "Stage"
 ERROR_COL = "ErrorCode"
 # ---------------------------------------------------- #
+
+# FCT stage codes used to identify FCT-repaired units
+FCT_STAGE_CODES = {"nh", "nx", "n2", "tp", "ni", "ua"}
 
 # ------------------ REPAIR PORTAL CONFIG ------------------ #
 LOGIN_URL = "https://mic-556.wmx.wistron/Portal/Login.aspx"
@@ -220,6 +224,7 @@ def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     time_col = pick("starttime", "start_time", "time", "test_time", "datetime", "start_time_str")
     status_col = pick("teststatus", "test_status", "status", "result")
     stage_col = pick("stage", "test_stage", "process_stage")
+    error_col = pick("errorcode", "error_code", "errcode")
 
     missing = [SN_COL if sn_col is None else None,
                TIME_COL if time_col is None else None,
@@ -229,12 +234,16 @@ def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     if missing:
         raise ValueError(f"Missing columns in test records: {missing}. Available: {list(df.columns)}")
 
-    df = df.rename(columns={
+    rename_map = {
         sn_col: SN_COL,
         time_col: TIME_COL,
         status_col: STATUS_COL,
         stage_col: STAGE_COL,
-    })
+    }
+    # ErrorCode is optional (some Excel files may lack it)
+    if error_col is not None and error_col != ERROR_COL:
+        rename_map[error_col] = ERROR_COL
+    df = df.rename(columns=rename_map)
     return df
 # ------------------------------------------------------------- #
 
@@ -367,18 +376,33 @@ def _parse_production_history(html: str) -> tuple[list[list[str]], int, int, int
     return data_rows, stage_idx, result_idx, data_idx, repair_row_idx
 
 
-def extract_repair_errorcode(html: str) -> str:
+def _extract_stage_code(stage_text: str) -> str:
+    """Extract code from parentheses: 'FCT 1(nh)' -> 'nh'."""
+    m = re.search(r"\((\w+)\)$", stage_text.strip())
+    return m.group(1).lower() if m else ""
+
+
+def extract_repair_errorcode(html: str, stage_filter: set[str] | None = None) -> str:
     data_rows, stage_idx, result_idx, data_idx, repair_row_idx = _parse_production_history(html)
     if not data_rows:
         return ""
 
-    # "Pre Test 1(TN)" before repair => I2C pretest
+    # "Pre Test 1(TN)" before repair => I2C pretest (checked before stage filtering)
     if repair_row_idx is not None and repair_row_idx > 0:
         prev_stage = data_rows[repair_row_idx - 1][stage_idx].strip().lower()
         if prev_stage == "pre test 1(tn)":
-            return "I2C pretest"
+            return "I2C pretest" if stage_filter is None else ""
 
     search_rows = data_rows[:repair_row_idx] if repair_row_idx is not None else data_rows
+
+    # Filter to specific stages when requested (e.g. FCT stages only)
+    if stage_filter:
+        search_rows = [
+            cells for cells in search_rows
+            if _extract_stage_code(cells[stage_idx]) in stage_filter
+        ]
+        if not search_rows:
+            return ""
 
     # 3+ consecutive fails => use that error code
     consecutive_fail = 0
@@ -405,10 +429,12 @@ def extract_repair_errorcode(html: str) -> str:
         if "fail" in result and data and data.upper() != "N/A":
             return data
 
-    # Fallback: last row data
-    last_data = data_rows[-1][data_idx].strip()
-    if last_data and last_data.upper() != "N/A":
-        return last_data
+    # Fallback: last row data (restricted to filtered rows if stage_filter is set)
+    fallback_rows = search_rows if stage_filter else data_rows
+    if fallback_rows:
+        last_data = fallback_rows[-1][data_idx].strip()
+        if last_data and last_data.upper() != "N/A":
+            return last_data
 
     return ""
 
@@ -424,18 +450,70 @@ def extract_repair_prev_stage(html: str) -> str:
     return data_rows[repair_row_idx - 1][stage_idx].strip()
 
 
-def has_repair_record(session: requests.Session, sn: str, log) -> tuple[int, str, str]:
+def has_repair_record(session: requests.Session, sn: str, log) -> tuple[int, str, str, str]:
     try:
         html = query_barcode(session, sn)
         html_lower = html.lower()
         has_repair = 1 if "fae repair(rn)" in html_lower else 0
         error_code = extract_repair_errorcode(html) if has_repair else ""
+        error_code_fct = extract_repair_errorcode(html, stage_filter=FCT_STAGE_CODES) if has_repair else ""
         prev_stage = extract_repair_prev_stage(html) if has_repair else ""
-        return has_repair, error_code, prev_stage
+        return has_repair, error_code, error_code_fct, prev_stage
     except Exception as e:
         log(f"Error querying {sn}: {e}")
-        return 0, "", ""
+        return 0, "", "", ""
 # ------------------------------------------------------------ #
+
+def _stage_failrate_summary(last_df: pd.DataFrame) -> pd.DataFrame:
+    """Per-stage pass/fail/total summary from last record per SN."""
+    pass_mask, fail_mask, _ = _status_masks(last_df[STATUS_COL])
+    last_df = last_df.copy()
+    last_df["_pass"] = pass_mask.astype(int)
+    last_df["_fail"] = fail_mask.astype(int)
+    grouped = last_df.groupby(STAGE_COL).agg(
+        Total=(SN_COL, "count"),
+        Pass=("_pass", "sum"),
+        Fail=("_fail", "sum"),
+    ).reset_index()
+    grouped["FailRate(%)"] = (grouped["Fail"] / grouped["Total"] * 100.0).where(grouped["Total"] > 0, 0.0)
+    return grouped.sort_values("FailRate(%)", ascending=False).reset_index(drop=True)
+
+
+def _stage_errorcode_ranking(last_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """ErrorCode ranking from raw test data fail records.
+
+    Returns (all_stages_df, per_stage_df).
+    all_stages_df: ErrorCode, Count, FailRate(%) across all stages.
+    per_stage_df: Stage, ErrorCode, Count, FailRate(%) per stage.
+    """
+    empty_all = pd.DataFrame(columns=[ERROR_COL, "Count", "FailRate(%)"])
+    empty_per = pd.DataFrame(columns=[STAGE_COL, ERROR_COL, "Count", "FailRate(%)"])
+
+    if ERROR_COL not in last_df.columns:
+        return empty_all, empty_per
+
+    _, fail_mask, _ = _status_masks(last_df[STATUS_COL])
+    fails = last_df[fail_mask].copy()
+    fails = fails[fails[ERROR_COL].notna() & (fails[ERROR_COL].astype(str).str.strip() != "")]
+    if fails.empty:
+        return empty_all, empty_per
+
+    total_units = int(last_df[SN_COL].nunique())
+
+    # All stages combined
+    all_ec = fails.groupby(ERROR_COL).size().reset_index(name="Count").sort_values("Count", ascending=False)
+    all_ec["FailRate(%)"] = (all_ec["Count"] / total_units * 100.0) if total_units else 0.0
+
+    # Per stage
+    stage_totals = last_df.groupby(STAGE_COL)[SN_COL].count()
+    per_ec = fails.groupby([STAGE_COL, ERROR_COL]).size().reset_index(name="Count")
+    per_ec["FailRate(%)"] = per_ec.apply(
+        lambda r: (r["Count"] / stage_totals.get(r[STAGE_COL], 1) * 100.0), axis=1
+    )
+    per_ec = per_ec.sort_values([STAGE_COL, "Count"], ascending=[True, False]).reset_index(drop=True)
+
+    return all_ec.reset_index(drop=True), per_ec
+
 
 def _errorcode_summary(
     df_last: pd.DataFrame,
@@ -465,12 +543,12 @@ def _create_repair_session(log) -> requests.Session:
     return session
 
 
-def _query_sn_with_pool(pool: queue.Queue, sn: str, log) -> tuple[str, int, str, str]:
+def _query_sn_with_pool(pool: queue.Queue, sn: str, log) -> tuple[str, int, str, str, str]:
     """Borrow a session from the pool, query repair record, return session."""
     session = pool.get()
     try:
-        has_repair, repair_error, prev_stage = has_repair_record(session, sn, log)
-        return sn, has_repair, repair_error, prev_stage
+        has_repair, repair_error, repair_error_fct, prev_stage = has_repair_record(session, sn, log)
+        return sn, has_repair, repair_error, repair_error_fct, prev_stage
     finally:
         pool.put(session)
 
@@ -499,6 +577,46 @@ def run_yield_and_errorcode_summary(log, excel_path: str = "", workers: int = 10
     last_df = df.groupby(SN_COL, as_index=False).tail(1).reset_index(drop=True)
     total_units = int(last_df[SN_COL].nunique())
 
+    # Per-stage fail rate summary (from raw test data)
+    stage_fr = _stage_failrate_summary(last_df)
+    stage_ec_all, stage_ec_per = _stage_errorcode_ranking(last_df)
+
+    # Shared table printer: consistent indent, optional rank column, formatted FailRate
+    def _print_table(df: pd.DataFrame, indent: str = "  ", ranked: bool = False):
+        if df.empty:
+            log(f"{indent}(none)")
+            return
+        disp = df.reset_index(drop=True)
+        if ranked:
+            disp.insert(0, "#", range(1, len(disp) + 1))
+        if "FailRate(%)" in disp.columns:
+            disp["FailRate(%)"] = disp["FailRate(%)"].map(lambda x: f"{x:.2f}")
+        for line in disp.to_string(index=False).splitlines():
+            log(f"{indent}{line}")
+
+    def _section(title: str, subtitle: str = ""):
+        log("")
+        log(f"{'── ' + title + ' ':─<60}")
+        if subtitle:
+            log(f"  {subtitle}")
+
+    _section("Per-Stage Summary (Last Record per SN)")
+    _print_table(stage_fr)
+
+    _section("ErrorCode Ranking — All Stages",
+             "(Data source: raw test data — last record per SN)")
+    _print_table(stage_ec_all, ranked=True)
+
+    _section("ErrorCode Ranking by Stage",
+             "(Data source: raw test data — last record per SN)")
+    if not stage_ec_per.empty:
+        for stage_name, grp in stage_ec_per.groupby(STAGE_COL, sort=True):
+            log(f"  [{stage_name}]")
+            _print_table(grp.drop(columns=[STAGE_COL]), indent="    ", ranked=True)
+            log("")
+    else:
+        log("  (none)")
+
     # Build session pool (parallel login)
     log(f"{'── Repair Lookup ':─<60}")
     log(f"Logging in {workers} sessions...")
@@ -521,6 +639,7 @@ def run_yield_and_errorcode_summary(log, excel_path: str = "", workers: int = 10
     sn_list = list(dict.fromkeys(last_df[SN_COL].tolist()))  # deduplicated, order preserved
     repair_map = {}
     repair_error_map = {}
+    repair_error_fct_map = {}
     repair_prev_stage_map = {}
     total_sns = len(sn_list)
     log(f"Checking {total_sns} units with {workers} workers...")
@@ -531,7 +650,7 @@ def run_yield_and_errorcode_summary(log, excel_path: str = "", workers: int = 10
     # Throttle progress: update every 10 units or on completion
     progress_interval = max(1, min(10, total_sns // 20))
 
-    def _worker(sn: str) -> tuple[str, int, str, str]:
+    def _worker(sn: str) -> tuple[str, int, str, str, str]:
         result = _query_sn_with_pool(session_pool, sn, log)
         with progress_lock:
             progress_counter[0] += 1
@@ -546,9 +665,10 @@ def run_yield_and_errorcode_summary(log, excel_path: str = "", workers: int = 10
         with ThreadPoolExecutor(max_workers=workers) as executor:
             futures = {executor.submit(_worker, sn): sn for sn in sn_list}
             for future in as_completed(futures):
-                sn, has_repair, repair_error, prev_stage = future.result()
+                sn, has_repair, repair_error, repair_error_fct, prev_stage = future.result()
                 repair_map[sn] = has_repair
                 repair_error_map[sn] = repair_error
+                repair_error_fct_map[sn] = repair_error_fct
                 repair_prev_stage_map[sn] = prev_stage
     finally:
         # Cleanup session pool
@@ -563,10 +683,10 @@ def run_yield_and_errorcode_summary(log, excel_path: str = "", workers: int = 10
 
     last_df["HasRepair"] = last_df[SN_COL].map(repair_map).fillna(0).astype(int)
     last_df["RepairErrorCode"] = last_df[SN_COL].map(repair_error_map).fillna("")
+    last_df["RepairErrorCodeFCT"] = last_df[SN_COL].map(repair_error_fct_map).fillna("")
     last_df["PrevRepairStage"] = last_df[SN_COL].map(repair_prev_stage_map).fillna("")
 
     # FCT stage filter
-    fct_stage_codes = {"nh", "nx", "n2", "tp", "ni", "ua"}
     prev_stage_code = (
         last_df["PrevRepairStage"]
         .astype(str)
@@ -575,7 +695,7 @@ def run_yield_and_errorcode_summary(log, excel_path: str = "", workers: int = 10
         .str.extract(r"\((\w+)\)$", expand=False)
         .fillna("")
     )
-    fct_repair_mask = (last_df["HasRepair"] == 1) & prev_stage_code.isin(fct_stage_codes)
+    fct_repair_mask = (last_df["HasRepair"] == 1) & prev_stage_code.isin(FCT_STAGE_CODES)
     fct_repaired_count = int(fct_repair_mask.sum())
 
     # ErrorCode summary for all repaired units
@@ -583,13 +703,13 @@ def run_yield_and_errorcode_summary(log, excel_path: str = "", workers: int = 10
     if "RepairErrorCode" in ec_repair.columns and ERROR_COL not in ec_repair.columns:
         ec_repair.rename(columns={"RepairErrorCode": ERROR_COL}, inplace=True)
 
-    # ErrorCode summary for FCT repaired units only
-    ec_repair_fct = _errorcode_summary(last_df, fct_repair_mask, total_units, error_col="RepairErrorCode")
-    if "RepairErrorCode" in ec_repair_fct.columns and ERROR_COL not in ec_repair_fct.columns:
-        ec_repair_fct.rename(columns={"RepairErrorCode": ERROR_COL}, inplace=True)
+    # ErrorCode summary for FCT repaired units only (using FCT-filtered error codes)
+    ec_repair_fct = _errorcode_summary(last_df, fct_repair_mask, total_units, error_col="RepairErrorCodeFCT")
+    if "RepairErrorCodeFCT" in ec_repair_fct.columns and ERROR_COL not in ec_repair_fct.columns:
+        ec_repair_fct.rename(columns={"RepairErrorCodeFCT": ERROR_COL}, inplace=True)
 
     # Serial number listing (repaired units only)
-    sn_cols = [SN_COL, STATUS_COL, STAGE_COL, TIME_COL, "HasRepair", "RepairErrorCode", "PrevRepairStage"]
+    sn_cols = [SN_COL, STATUS_COL, STAGE_COL, TIME_COL, "HasRepair", "RepairErrorCode", "RepairErrorCodeFCT", "PrevRepairStage"]
     sn_repair = last_df[last_df["HasRepair"] == 1][sn_cols].copy()
     sn_repair_fct = last_df[fct_repair_mask][sn_cols].copy()
 
@@ -632,26 +752,13 @@ def run_yield_and_errorcode_summary(log, excel_path: str = "", workers: int = 10
         log(f"  {col:<22s}: {val_str:>8s}")
     log("=" * 60)
 
-    def _print_ec_table(ec_df: pd.DataFrame):
-        if ec_df.empty:
-            log("  (none)")
-            return
-        display = ec_df.reset_index(drop=True)
-        display.insert(0, "#", range(1, len(display) + 1))
-        display["FailRate(%)"] = display["FailRate(%)"].map(lambda x: f"{x:.2f}")
-        for line in display.to_string(index=False).splitlines():
-            log(line)
+    _section("ERRORCODES — All Repaired Units",
+             "(Data source: Repair portal — units with FAE Repair(RN) record)")
+    _print_table(ec_repair, ranked=True)
 
-    log("")
-    log("-" * 60)
-    log("  ERRORCODES — All Repaired Units")
-    log("-" * 60)
-    _print_ec_table(ec_repair)
-    log("")
-    log("-" * 60)
-    log(f"  ERRORCODES — FCT Repaired Units ({'/'.join(sorted(fct_stage_codes, key=str.upper))})")
-    log("-" * 60)
-    _print_ec_table(ec_repair_fct)
+    _section(f"ERRORCODES — FCT Repaired Units ({'/'.join(sorted(FCT_STAGE_CODES, key=str.upper))})",
+             "(Data source: Repair portal — units repaired at FCT stages only)")
+    _print_table(ec_repair_fct, ranked=True)
 
     # Save Excel
     ts = datetime.now().strftime("%Y%m%d%H%M")
@@ -664,6 +771,9 @@ def run_yield_and_errorcode_summary(log, excel_path: str = "", workers: int = 10
         ec_repair_fct.to_excel(excel_writer=writer, sheet_name="ErrorCode_Repaired(FCT)", index=False)
         sn_repair.to_excel(excel_writer=writer, sheet_name="SN_Repaired", index=False)
         sn_repair_fct.to_excel(excel_writer=writer, sheet_name="SN_Repaired(FCT)", index=False)
+        stage_fr.to_excel(excel_writer=writer, sheet_name="Stage_FailRate", index=False)
+        stage_ec_all.to_excel(excel_writer=writer, sheet_name="Stage_ErrorCode_All", index=False)
+        stage_ec_per.to_excel(excel_writer=writer, sheet_name="Stage_ErrorCode", index=False)
 
     log(f"Saved: {out_name}")
     return out_name
@@ -674,13 +784,24 @@ def log(msg: str):
     print(f"[{ts}] {msg}", flush=True)
 
 
-def _validate_date(date_str: str) -> str:
-    """Validate YYYY-MM-DD format and return 'YYYY-MM-DD 18:00'."""
-    try:
-        datetime.strptime(date_str, "%Y-%m-%d")
-    except ValueError:
-        raise argparse.ArgumentTypeError(f"Invalid date format: '{date_str}'. Expected YYYY-MM-DD.")
-    return f"{date_str} 18:00"
+def _validate_datetime(date_str: str) -> str:
+    """Validate date/datetime and return 'YYYY-MM-DD HH:MM'.
+
+    Accepts:
+      - YYYY-MM-DD        -> defaults to 18:00
+      - YYYY-MM-DD HH:MM  -> used as-is
+    """
+    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            parsed = datetime.strptime(date_str, fmt)
+            if fmt == "%Y-%m-%d":
+                parsed = parsed.replace(hour=18, minute=0)
+            return parsed.strftime("%Y-%m-%d %H:%M")
+        except ValueError:
+            continue
+    raise argparse.ArgumentTypeError(
+        f"Invalid format: '{date_str}'. Expected YYYY-MM-DD or 'YYYY-MM-DD HH:MM'."
+    )
 
 
 def main():
@@ -688,8 +809,8 @@ def main():
 
     parser = argparse.ArgumentParser(description="Testing Summary Tool (CLI)")
     parser.add_argument("-f", "--file", default="", help="Path to local Excel file (skip portal fetch)")
-    parser.add_argument("-s", "--start-date", default="", help="Start date (YYYY-MM-DD), auto-appends 18:00")
-    parser.add_argument("-e", "--end-date", default="", help="End date (YYYY-MM-DD), auto-appends 18:00")
+    parser.add_argument("-s", "--start-date", nargs="+", default=[], help="Start: YYYY-MM-DD [HH:MM] (default time 18:00)")
+    parser.add_argument("-e", "--end-date", nargs="+", default=[], help="End: YYYY-MM-DD [HH:MM] (default time 18:00)")
     parser.add_argument("-w", "--workers", type=int, default=10, choices=range(1, 21),
                         metavar="[1-20]", help="Number of concurrent repair workers (default: 10)")
     args = parser.parse_args()
@@ -698,10 +819,10 @@ def main():
         parser.error("Either -f/--file or both -s/--start-date and -e/--end-date are required.")
 
     if args.start_date:
-        TEST_START_TIME = _validate_date(args.start_date)
+        TEST_START_TIME = _validate_datetime(" ".join(args.start_date))
         log(f"Start time: {TEST_START_TIME}")
     if args.end_date:
-        TEST_END_TIME = _validate_date(args.end_date)
+        TEST_END_TIME = _validate_datetime(" ".join(args.end_date))
         log(f"End time: {TEST_END_TIME}")
 
     try:
