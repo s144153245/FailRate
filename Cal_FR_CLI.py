@@ -717,8 +717,8 @@ def run_yield_and_errorcode_summary(log, excel_path: str = "", workers: int = 10
     8. Compute yield metrics:
        - FPY = pass_without_any_repair / total_units
        - YR = pass / (pass + fail)
-       - FPY(FCT) = pass_without_fct_repair / total_units
-       - YR(FCT) = pass_no_fct / (pass_no_fct + fail_no_fct)
+       - FPY(FCT) = FCT pass w/o FCT repair / FCT total (units that reached FCT stage)
+       - YR(FCT) = FCT pass / (FCT pass + FCT fail) (units that reached FCT stage)
     9. Print CLI tables (tabulate rounded_grid format)
     10. Export multi-sheet Excel workbook
 
@@ -913,11 +913,15 @@ def run_yield_and_errorcode_summary(log, excel_path: str = "", workers: int = 10
     pass_fail_count = int((pass_mask | fail_mask).sum())
     pass_no_repair_count = int((pass_mask & (last_df["HasRepair"] == 0)).sum())
     testing_count = int(testing_mask.sum())
-    pass_no_fct_repair_count = int((pass_mask & ~fct_repair_mask).sum())
     fail_count = int(fail_mask.sum())
-    # YR(FCT) denominator: pass (excluding FCT-repaired) + fail (excluding FCT-repaired)
-    fail_no_fct_repair_count = int((fail_mask & ~fct_repair_mask).sum())
-    yr_fct_denom = pass_no_fct_repair_count + fail_no_fct_repair_count
+    # FCT stage metrics: scope to units that reached FCT (last stage >= FCT)
+    fct_idx = STAGE_DISPLAY_ORDER.index("FCT")
+    fct_and_beyond = {s.upper() for s in STAGE_DISPLAY_ORDER[fct_idx:]}
+    fct_stage_mask = last_df[STAGE_COL].str.strip().str.upper().isin(fct_and_beyond)
+    fct_total = int(fct_stage_mask.sum())
+    fct_pass = int((pass_mask & fct_stage_mask).sum())
+    fct_fail = int((fail_mask & fct_stage_mask).sum())
+    fct_pass_no_repair = int((pass_mask & fct_stage_mask & ~fct_repair_mask).sum())
 
     # --- Yield metric computation ---
     summary_df = pd.DataFrame([{
@@ -929,8 +933,8 @@ def run_yield_and_errorcode_summary(log, excel_path: str = "", workers: int = 10
         "TestingUnits": testing_count,
         "FPY": (pass_no_repair_count / total_units) if total_units else 0.0,
         "YR": (pass_count / pass_fail_count) if pass_fail_count else 0.0,
-        "FPY(FCT)": (pass_no_fct_repair_count / total_units) if total_units else 0.0,
-        "YR(FCT)": (pass_no_fct_repair_count / yr_fct_denom) if yr_fct_denom else 0.0,
+        "FPY(FCT)": (fct_pass_no_repair / fct_total) if fct_total else 0.0,
+        "YR(FCT)": (fct_pass / (fct_pass + fct_fail)) if (fct_pass + fct_fail) else 0.0,
     }])
 
     # Print summary as tabulate table (vertical key-value layout)
@@ -946,7 +950,7 @@ def run_yield_and_errorcode_summary(log, excel_path: str = "", workers: int = 10
     for line in table.splitlines():
         log(f"  {line}")
     log("  FPY = Pass without any repair / Total  |  YR = Pass / (Pass + Fail)")
-    log("  FPY(FCT) = Pass without FCT-stage repair / Total  |  YR(FCT) excludes FCT-repaired units")
+    log("  FPY(FCT) = FCT Pass w/o FCT repair / FCT Total  |  YR(FCT) = FCT Pass / (FCT Pass + FCT Fail)")
     log("  FCT stages: NH, NX, N2, TP, NI, UA")
 
     _section("ERRORCODES — All Repaired Units",
