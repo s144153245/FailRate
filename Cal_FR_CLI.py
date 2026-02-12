@@ -16,7 +16,7 @@ Architecture / Data Flow
 3. **Analysis Pipeline** (pandas)
    - Keep last test record per serial number (sort by time, groupby tail)
    - Join repair data (HasRepair, RepairErrorCode, RepairErrorCodeFCT, PrevRepairStage)
-   - Compute yield metrics: FPYP, YR, FPY(FCT), YR(FCT)
+   - Compute yield metrics: FPY, YR, FPY(FCT), YR(FCT)
    - Compute per-stage fail rates and error code rankings from raw test data
    - Compute repair-sourced error code summaries (all repaired + FCT-only)
 
@@ -653,6 +653,7 @@ def _stage_errorcode_ranking(last_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Da
     per_ec["FailRate(%)"] = per_ec.apply(
         lambda r: (r["Count"] / stage_totals.get(r[STAGE_COL], 1) * 100.0), axis=1
     )
+    per_ec[STAGE_COL] = pd.Categorical(per_ec[STAGE_COL], categories=STAGE_DISPLAY_ORDER, ordered=True)
     per_ec = per_ec.sort_values([STAGE_COL, "Count"], ascending=[True, False]).reset_index(drop=True)
 
     return all_ec.reset_index(drop=True), per_ec
@@ -714,7 +715,7 @@ def run_yield_and_errorcode_summary(log, excel_path: str = "", workers: int = 10
     6. Concurrently query repair status for each unique SN
     7. Join repair data onto last_df (HasRepair, RepairErrorCode, etc.)
     8. Compute yield metrics:
-       - FPYP = pass_without_any_repair / total_units
+       - FPY = pass_without_any_repair / total_units
        - YR = pass / (pass + fail)
        - FPY(FCT) = pass_without_fct_repair / total_units
        - YR(FCT) = pass_no_fct / (pass_no_fct + fail_no_fct)
@@ -772,7 +773,8 @@ def run_yield_and_errorcode_summary(log, excel_path: str = "", workers: int = 10
             disp["FailRate(%)"] = disp["FailRate(%)"].map(lambda x: f"{x:.2f}")
         right_cols = {"#", "Total", "Pass", "Fail", "Testing", "Count", "FailRate(%)"}
         colalign = tuple("right" if c in right_cols else "left" for c in disp.columns)
-        table = tabulate(disp.values, headers=disp.columns, tablefmt="rounded_grid", colalign=colalign)
+        table = tabulate(disp.values, headers=disp.columns, tablefmt="rounded_grid",
+                         colalign=colalign, disable_numparse=True)
         for line in table.splitlines():
             log(f"{indent}{line}")
 
@@ -786,8 +788,8 @@ def run_yield_and_errorcode_summary(log, excel_path: str = "", workers: int = 10
     _print_table(stage_fr)
     if not stage_fr.empty:
         total_pass = stage_fr["Pass"].sum()
-        total_units = stage_fr["Total"].sum()
-        final_yield = (total_pass / total_units * 100) if total_units > 0 else 0.0
+        all_records_total = stage_fr["Total"].sum()
+        final_yield = (total_pass / all_records_total * 100) if all_records_total > 0 else 0.0
         log(f"  Final Yield: {final_yield:.2f}%")
     log("  Note: Counts all test records in date range (not deduplicated by SN).")
 
@@ -799,7 +801,10 @@ def run_yield_and_errorcode_summary(log, excel_path: str = "", workers: int = 10
     _section("ErrorCode Ranking by Stage",
              "(Data source: raw test data — last record per SN)")
     if not stage_ec_per.empty:
-        for stage_name, grp in stage_ec_per.groupby(STAGE_COL, sort=True):
+        for stage_name in STAGE_DISPLAY_ORDER:
+            grp = stage_ec_per[stage_ec_per[STAGE_COL] == stage_name]
+            if grp.empty:
+                continue
             log(f"  [{stage_name}]")
             _print_table(grp.drop(columns=[STAGE_COL]), indent="    ", ranked=True)
             log("")
@@ -922,14 +927,14 @@ def run_yield_and_errorcode_summary(log, excel_path: str = "", workers: int = 10
         "PassUnits": pass_count,
         "FailUnits": fail_count,
         "TestingUnits": testing_count,
-        "FPYP": (pass_no_repair_count / total_units) if total_units else 0.0,
+        "FPY": (pass_no_repair_count / total_units) if total_units else 0.0,
         "YR": (pass_count / pass_fail_count) if pass_fail_count else 0.0,
         "FPY(FCT)": (pass_no_fct_repair_count / total_units) if total_units else 0.0,
         "YR(FCT)": (pass_no_fct_repair_count / yr_fct_denom) if yr_fct_denom else 0.0,
     }])
 
     # Print summary as tabulate table (vertical key-value layout)
-    rate_keys = {"FPYP", "YR", "FPY(FCT)", "YR(FCT)"}
+    rate_keys = {"FPY", "YR", "FPY(FCT)", "YR(FCT)"}
     summary_rows = []
     for col in summary_df.columns:
         val = summary_df[col].iloc[0]
@@ -940,7 +945,7 @@ def run_yield_and_errorcode_summary(log, excel_path: str = "", workers: int = 10
                      tablefmt="rounded_grid", colalign=("left", "right"))
     for line in table.splitlines():
         log(f"  {line}")
-    log("  FPYP = Pass without any repair / Total  |  YR = Pass / (Pass + Fail)")
+    log("  FPY = Pass without any repair / Total  |  YR = Pass / (Pass + Fail)")
     log("  FPY(FCT) = Pass without FCT-stage repair / Total  |  YR(FCT) excludes FCT-repaired units")
     log("  FCT stages: NH, NX, N2, TP, NI, UA")
 
@@ -961,7 +966,7 @@ def run_yield_and_errorcode_summary(log, excel_path: str = "", workers: int = 10
     header_line1 = f"Generated: {gen_time} | Date range: {date_range_str}"
 
     sheet_descriptions = {
-        "Summary": "Yield metrics: FPYP, YR, FPY(FCT), YR(FCT). FCT stages: NH/NX/N2/TP/NI/UA",
+        "Summary": "Yield metrics: FPY, YR, FPY(FCT), YR(FCT). FCT stages: NH/NX/N2/TP/NI/UA",
         "Last_Record_Per_SN": "Last test record per SN joined with repair portal data",
         "ErrorCode_Repaired": "Error code frequency for all units with repair history",
         "ErrorCode_Repaired(FCT)": "Error code frequency for FCT-stage repaired units only",
