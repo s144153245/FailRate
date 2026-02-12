@@ -92,8 +92,8 @@ Generates `yield_errorcode_summary_YYYYMMDDHHMM.xlsx` with sheets. Each sheet in
 |--------|---------|
 | **FPYP** (First Pass Yield w/o repair) | Pass units without any repair / Total units |
 | **YR** (Yield Rate) | Pass units / (Pass + Fail units) |
-| **FPY(FCT)** | Pass units without FCT-stage repair / Total units |
-| **YR(FCT)** | Pass units without FCT repair / (Pass without FCT repair + Fail without FCT repair) |
+| **FPY(FCT)** | FCT pass without FCT repair / FCT total (units that reached FCT stage) |
+| **YR(FCT)** | FCT pass / (FCT pass + FCT fail) (units that reached FCT stage) |
 
 FCT stages: NH, NX, N2, TP, NI, UA
 
