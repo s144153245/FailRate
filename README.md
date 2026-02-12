@@ -65,7 +65,7 @@ python3 Cal_FR_CLI.py -f data.xlsx -w 1
 
 The tool prints formatted tables to the terminal using `tabulate` (`rounded_grid` format):
 
-- **Per-Stage Summary** — pass/fail/total/fail-rate per test stage
+- **Per-Stage Summary** — pass/fail/testing/total/fail-rate per test stage (all records, not deduplicated by SN)
 - **ErrorCode Ranking (All Stages)** — error code frequency from raw test data
 - **ErrorCode Ranking by Stage** — error code frequency broken down per stage
 - **Summary** — vertical key-value table of all yield metrics
@@ -74,7 +74,7 @@ The tool prints formatted tables to the terminal using `tabulate` (`rounded_grid
 
 ### Excel File
 
-Generates `yield_errorcode_summary_YYYYMMDDHHMM.xlsx` with sheets:
+Generates `yield_errorcode_summary_YYYYMMDDHHMM.xlsx` with sheets. Each sheet includes a timestamp header and data description in the first two rows:
 
 - **Summary** — TotalUnits, RepairedUnits, RepairedUnits(FCT), PassUnits, FailUnits, TestingUnits, FPYP, YR, FPY(FCT), YR(FCT)
 - **Last_Record_Per_SN** — Last test record per serial number with repair info
@@ -82,7 +82,7 @@ Generates `yield_errorcode_summary_YYYYMMDDHHMM.xlsx` with sheets:
 - **ErrorCode_Repaired(FCT)** — Error code frequency for FCT-stage repaired units
 - **SN_Repaired** — Detail listing of all repaired serial numbers
 - **SN_Repaired(FCT)** — Detail listing of FCT-stage repaired serial numbers
-- **Stage_FailRate** — Per-stage pass/fail/total/fail-rate from raw test data
+- **Stage_FailRate** — Per-stage pass/fail/testing/total/fail-rate from all records (not deduplicated by SN)
 - **Stage_ErrorCode_All** — Error code ranking across all stages
 - **Stage_ErrorCode** — Error code ranking broken down per stage
 

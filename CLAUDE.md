@@ -35,10 +35,11 @@ Requires: `pandas`, `requests`, `beautifulsoup4`, `openpyxl`, `tabulate`. Option
 
 ## Yield Metric Definitions
 
-- **FPYP**: Pass units without any repair / Total units
-- **YR**: Pass units / (Pass + Fail units)
+- **FPYP** (First Pass Yield w/o repair): Pass units without any repair history / Total units
+- **YR** (Yield Rate): Pass units / (Pass + Fail units) — excludes Testing units
 - **FPY(FCT)**: Pass units without FCT-stage repair / Total units
-- **YR(FCT)**: Pass without FCT repair / (Pass without FCT repair + Fail without FCT repair)
+- **YR(FCT)**: Pass without FCT repair / (Pass without FCT repair + Fail without FCT repair) — excludes FCT-repaired units from both numerator and denominator
+- FCT stages: NH, NX, N2, TP, NI, UA (defined in `FCT_STAGE_CODES`)
 
 ## Security Warning
 

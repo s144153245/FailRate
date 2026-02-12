@@ -69,6 +69,9 @@ ERROR_COL = "ErrorCode"
 # FCT stage codes used to identify FCT-repaired units
 FCT_STAGE_CODES = {"nh", "nx", "n2", "tp", "ni", "ua"}
 
+# Display order for per-stage fail rate table
+STAGE_DISPLAY_ORDER = ["FLA", "FLC", "PreTest", "FCT", "FINT", "OS Installation"]
+
 # ------------------ REPAIR PORTAL CONFIG ------------------ #
 LOGIN_URL = "https://mic-556.wmx.wistron/Portal/Login.aspx"
 BARCODE_URL = "https://mic-556.wmx.wistron/MIBASIC000/MIBASIC003.aspx"
@@ -101,8 +104,8 @@ TEST_PAGE_CAP = 200000
 
 # ------------------ TEST DATA PORTAL HELPERS ------------------ #
 STATUS_PASS_VALUES = {"pass", "0"}
-STATUS_FAIL_VALUES = {"fail", "1", "unfinish", "unfinished"}
-STATUS_TESTING_VALUES = {"testing", "2"}
+STATUS_FAIL_VALUES = {"fail", "1"}
+STATUS_TESTING_VALUES = {"testing", "2", "unfinish", "unfinished"}
 
 
 def _status_masks(series: pd.Series) -> tuple[pd.Series, pd.Series, pd.Series]:
@@ -601,19 +604,22 @@ def has_repair_record(session: requests.Session, sn: str, log) -> tuple[int, str
         return 0, "", "", ""
 # ------------------------------------------------------------ #
 
-def _stage_failrate_summary(last_df: pd.DataFrame) -> pd.DataFrame:
-    """Per-stage pass/fail/total summary from last record per SN."""
-    pass_mask, fail_mask, _ = _status_masks(last_df[STATUS_COL])
-    last_df = last_df.copy()
-    last_df["_pass"] = pass_mask.astype(int)
-    last_df["_fail"] = fail_mask.astype(int)
-    grouped = last_df.groupby(STAGE_COL).agg(
+def _stage_failrate_summary(df: pd.DataFrame) -> pd.DataFrame:
+    """Per-stage pass/fail/testing/total summary from all records."""
+    pass_mask, fail_mask, testing_mask = _status_masks(df[STATUS_COL])
+    df = df.copy()
+    df["_pass"] = pass_mask.astype(int)
+    df["_fail"] = fail_mask.astype(int)
+    df["_testing"] = testing_mask.astype(int)
+    grouped = df.groupby(STAGE_COL).agg(
         Total=(SN_COL, "count"),
         Pass=("_pass", "sum"),
         Fail=("_fail", "sum"),
+        Testing=("_testing", "sum"),
     ).reset_index()
     grouped["FailRate(%)"] = (grouped["Fail"] / grouped["Total"] * 100.0).where(grouped["Total"] > 0, 0.0)
-    return grouped.sort_values("FailRate(%)", ascending=False).reset_index(drop=True)
+    grouped[STAGE_COL] = pd.Categorical(grouped[STAGE_COL], categories=STAGE_DISPLAY_ORDER, ordered=True)
+    return grouped.sort_values(STAGE_COL).reset_index(drop=True)
 
 
 def _stage_errorcode_ranking(last_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -751,7 +757,7 @@ def run_yield_and_errorcode_summary(log, excel_path: str = "", workers: int = 10
     total_units = int(last_df[SN_COL].nunique())
 
     # Per-stage fail rate summary (from raw test data)
-    stage_fr = _stage_failrate_summary(last_df)
+    stage_fr = _stage_failrate_summary(df)
     stage_ec_all, stage_ec_per = _stage_errorcode_ranking(last_df)
 
     # Shared table printer: consistent indent, optional rank column, formatted FailRate
@@ -764,7 +770,7 @@ def run_yield_and_errorcode_summary(log, excel_path: str = "", workers: int = 10
             disp.insert(0, "#", range(1, len(disp) + 1))
         if "FailRate(%)" in disp.columns:
             disp["FailRate(%)"] = disp["FailRate(%)"].map(lambda x: f"{x:.2f}")
-        right_cols = {"#", "Total", "Pass", "Fail", "Count", "FailRate(%)"}
+        right_cols = {"#", "Total", "Pass", "Fail", "Testing", "Count", "FailRate(%)"}
         colalign = tuple("right" if c in right_cols else "left" for c in disp.columns)
         table = tabulate(disp.values, headers=disp.columns, tablefmt="rounded_grid", colalign=colalign)
         for line in table.splitlines():
@@ -776,12 +782,19 @@ def run_yield_and_errorcode_summary(log, excel_path: str = "", workers: int = 10
         if subtitle:
             log(f"  {subtitle}")
 
-    _section("Per-Stage Summary (Last Record per SN)")
+    _section("Per-Stage Summary (All Records)")
     _print_table(stage_fr)
+    if not stage_fr.empty:
+        total_pass = stage_fr["Pass"].sum()
+        total_units = stage_fr["Total"].sum()
+        final_yield = (total_pass / total_units * 100) if total_units > 0 else 0.0
+        log(f"  Final Yield: {final_yield:.2f}%")
+    log("  Note: Counts all test records in date range (not deduplicated by SN).")
 
     _section("ErrorCode Ranking — All Stages",
              "(Data source: raw test data — last record per SN)")
     _print_table(stage_ec_all, ranked=True)
+    log("  Note: Based on last record per SN.")
 
     _section("ErrorCode Ranking by Stage",
              "(Data source: raw test data — last record per SN)")
@@ -792,6 +805,7 @@ def run_yield_and_errorcode_summary(log, excel_path: str = "", workers: int = 10
             log("")
     else:
         log("  (none)")
+    log("  Note: Based on last record per SN.")
 
     # Build session pool (parallel login)
     log(f"{'── Repair Lookup ':─<60}")
@@ -926,29 +940,58 @@ def run_yield_and_errorcode_summary(log, excel_path: str = "", workers: int = 10
                      tablefmt="rounded_grid", colalign=("left", "right"))
     for line in table.splitlines():
         log(f"  {line}")
+    log("  FPYP = Pass without any repair / Total  |  YR = Pass / (Pass + Fail)")
+    log("  FPY(FCT) = Pass without FCT-stage repair / Total  |  YR(FCT) excludes FCT-repaired units")
+    log("  FCT stages: NH, NX, N2, TP, NI, UA")
 
     _section("ERRORCODES — All Repaired Units",
              "(Data source: Repair portal — units with FAE Repair(RN) record)")
     _print_table(ec_repair, ranked=True)
+    log("  Note: Error codes from repair portal.")
 
     _section(f"ERRORCODES — FCT Repaired Units ({'/'.join(sorted(FCT_STAGE_CODES, key=str.upper))})",
              "(Data source: Repair portal — units repaired at FCT stages only)")
     _print_table(ec_repair_fct, ranked=True)
+    log("  Note: Filtered to FCT-stage repairs only.")
 
-    # Save Excel
+    # Save Excel with header rows (timestamp + description)
     ts = datetime.now().strftime("%Y%m%d%H%M")
+    gen_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    date_range_str = f"{TEST_START_TIME} ~ {TEST_END_TIME}"
+    header_line1 = f"Generated: {gen_time} | Date range: {date_range_str}"
+
+    sheet_descriptions = {
+        "Summary": "Yield metrics: FPYP, YR, FPY(FCT), YR(FCT). FCT stages: NH/NX/N2/TP/NI/UA",
+        "Last_Record_Per_SN": "Last test record per SN joined with repair portal data",
+        "ErrorCode_Repaired": "Error code frequency for all units with repair history",
+        "ErrorCode_Repaired(FCT)": "Error code frequency for FCT-stage repaired units only",
+        "SN_Repaired": "Detail listing of all repaired serial numbers",
+        "SN_Repaired(FCT)": "Detail listing of FCT-stage repaired serial numbers",
+        "Stage_FailRate": "Per-stage pass/fail/testing from all records (not deduplicated by SN)",
+        "Stage_ErrorCode_All": "Error code ranking across all stages (last record per SN)",
+        "Stage_ErrorCode": "Error code ranking per stage (last record per SN)",
+    }
+
     out_name = f"yield_errorcode_summary_{ts}.xlsx"
     with pd.ExcelWriter(out_name) as writer:
-        summary_df.to_excel(excel_writer=writer, sheet_name="Summary", index=False)
         excel_last_df = last_df.drop(columns=[c for c in [ERROR_COL] if c in last_df.columns])
-        excel_last_df.to_excel(excel_writer=writer, sheet_name="Last_Record_Per_SN", index=False)
-        ec_repair.to_excel(excel_writer=writer, sheet_name="ErrorCode_Repaired", index=False)
-        ec_repair_fct.to_excel(excel_writer=writer, sheet_name="ErrorCode_Repaired(FCT)", index=False)
-        sn_repair.to_excel(excel_writer=writer, sheet_name="SN_Repaired", index=False)
-        sn_repair_fct.to_excel(excel_writer=writer, sheet_name="SN_Repaired(FCT)", index=False)
-        stage_fr.to_excel(excel_writer=writer, sheet_name="Stage_FailRate", index=False)
-        stage_ec_all.to_excel(excel_writer=writer, sheet_name="Stage_ErrorCode_All", index=False)
-        stage_ec_per.to_excel(excel_writer=writer, sheet_name="Stage_ErrorCode", index=False)
+        for data, name in [
+            (summary_df, "Summary"),
+            (excel_last_df, "Last_Record_Per_SN"),
+            (ec_repair, "ErrorCode_Repaired"),
+            (ec_repair_fct, "ErrorCode_Repaired(FCT)"),
+            (sn_repair, "SN_Repaired"),
+            (sn_repair_fct, "SN_Repaired(FCT)"),
+            (stage_fr, "Stage_FailRate"),
+            (stage_ec_all, "Stage_ErrorCode_All"),
+            (stage_ec_per, "Stage_ErrorCode"),
+        ]:
+            # Write data starting at row 4 (startrow=3) to leave room for headers
+            data.to_excel(excel_writer=writer, sheet_name=name, index=False, startrow=3)
+            # Insert header rows above the data
+            ws = writer.sheets[name]
+            ws.cell(row=1, column=1, value=header_line1)
+            ws.cell(row=2, column=1, value=sheet_descriptions.get(name, ""))
 
     log(f"Saved: {out_name}")
     return out_name
